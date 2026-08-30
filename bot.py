@@ -2,9 +2,10 @@ import asyncio
 import logging
 import os
 import random
+import sqlite3
 from datetime import datetime, date
+from html import escape
 
-import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -15,263 +16,660 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
-from dotenv import load_dotenv
 
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Необязательно.
-# Если оставишь пустым — AI-функция просто сообщит,
-# что AI пока не настроен.
-AI_API_KEY = os.getenv("AI_API_KEY", "")
-
-DB_NAME = "bot.db"
-
-logging.basicConfig(level=logging.INFO)
-
-
-# =========================================================
-# BOT
-# =========================================================
+# AI_API_KEY можно добавить позже.
+# Бот будет работать и БЕЗ него.
+AI_API_KEY = os.getenv("AI_API_KEY")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN не найден в переменных окружения.")
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Railway Variables."
+    )
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+
+# =========================================================
+# LOGGING
+# =========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-dp = Dispatcher()
+logger = logging.getLogger(__name__)
 
 
 # =========================================================
 # DATABASE
 # =========================================================
 
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                balance INTEGER DEFAULT 0,
-                xp INTEGER DEFAULT 0,
-                level INTEGER DEFAULT 1,
-                games INTEGER DEFAULT 0,
-                referrals INTEGER DEFAULT 0,
-                streak INTEGER DEFAULT 0,
-                last_bonus TEXT,
-                joined_at TEXT
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS achievements (
-                user_id INTEGER,
-                achievement TEXT,
-                UNIQUE(user_id, achievement)
-            )
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS ai_history (
-                user_id INTEGER,
-                role TEXT,
-                text TEXT,
-                created_at TEXT
-            )
-        """)
-
-        await db.commit()
+DB_FILE = "studybot.db"
 
 
-async def create_user(user: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
+def db():
+    return sqlite3.connect(DB_FILE)
 
-        cur = await db.execute(
-            "SELECT id FROM users WHERE id = ?",
-            (user.from_user.id,)
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            xp INTEGER DEFAULT 0,
+            level INTEGER DEFAULT 1,
+            questions INTEGER DEFAULT 0,
+            correct INTEGER DEFAULT 0,
+            streak INTEGER DEFAULT 0,
+            last_day TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            subject TEXT,
+            question TEXT,
+            answer TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            question TEXT,
+            answer TEXT,
+            created_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def create_user(user_id: int, name: str):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+
+    if not cur.fetchone():
+        cur.execute(
+            """
+            INSERT INTO users
+            (user_id, name, xp, level, questions, correct, streak, last_day)
+            VALUES (?, ?, 0, 1, 0, 0, 0, '')
+            """,
+            (user_id, name),
         )
 
-        exists = await cur.fetchone()
-
-        if not exists:
-            await db.execute("""
-                INSERT INTO users
-                (id, username, first_name, joined_at)
-                VALUES (?, ?, ?, ?)
-            """, (
-                user.from_user.id,
-                user.from_user.username or "",
-                user.from_user.first_name or "",
-                datetime.now().isoformat()
-            ))
-
-            await db.commit()
+    conn.commit()
+    conn.close()
 
 
-async def get_user(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
+def get_user(user_id: int):
+    conn = db()
+    cur = conn.cursor()
 
-        cur = await db.execute(
-            "SELECT * FROM users WHERE id = ?",
-            (user_id,)
-        )
+    cur.execute(
+        "SELECT * FROM users WHERE user_id = ?",
+        (user_id,),
+    )
 
-        return await cur.fetchone()
+    row = cur.fetchone()
+
+    conn.close()
+
+    return row
 
 
-async def add_xp(user_id, amount):
+def add_xp(user_id: int, amount: int):
+    conn = db()
+    cur = conn.cursor()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    cur.execute(
+        """
+        UPDATE users
+        SET xp = xp + ?
+        WHERE user_id = ?
+        """,
+        (amount, user_id),
+    )
 
-        cur = await db.execute(
-            "SELECT xp, level FROM users WHERE id = ?",
-            (user_id,)
-        )
+    cur.execute(
+        "SELECT xp FROM users WHERE user_id = ?",
+        (user_id,),
+    )
 
-        row = await cur.fetchone()
+    row = cur.fetchone()
 
-        if not row:
-            return
+    if row:
+        xp = row[0]
+        level = xp // 100 + 1
 
-        xp, level = row
-
-        xp += amount
-
-        new_level = max(1, xp // 100 + 1)
-
-        await db.execute("""
+        cur.execute(
+            """
             UPDATE users
-            SET xp = ?, level = ?
-            WHERE id = ?
-        """, (
-            xp,
-            new_level,
-            user_id
-        ))
+            SET level = ?
+            WHERE user_id = ?
+            """,
+            (level, user_id),
+        )
 
-        await db.commit()
+    conn.commit()
+    conn.close()
 
 
-async def add_balance(user_id, amount):
+def register_question(user_id: int):
+    conn = db()
+    cur = conn.cursor()
 
-    async with aiosqlite.connect(DB_NAME) as db:
+    cur.execute(
+        """
+        UPDATE users
+        SET questions = questions + 1
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
 
-        await db.execute("""
-            UPDATE users
-            SET balance = balance + ?
-            WHERE id = ?
-        """, (
-            amount,
-            user_id
-        ))
+    conn.commit()
+    conn.close()
 
-        await db.commit()
+
+def register_correct(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        UPDATE users
+        SET correct = correct + 1
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def update_streak(user_id: int):
+    today = date.today().isoformat()
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT last_day, streak FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return
+
+    last_day, streak = row
+
+    if last_day == today:
+        conn.close()
+        return
+
+    if last_day:
+        try:
+            old = date.fromisoformat(last_day)
+            diff = (date.today() - old).days
+
+            if diff == 1:
+                streak += 1
+            else:
+                streak = 1
+
+        except Exception:
+            streak = 1
+
+    else:
+        streak = 1
+
+    cur.execute(
+        """
+        UPDATE users
+        SET streak = ?, last_day = ?
+        WHERE user_id = ?
+        """,
+        (streak, today, user_id),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_history(
+    user_id: int,
+    subject: str,
+    question: str,
+    answer: str,
+):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO history
+        (user_id, subject, question, answer, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            subject,
+            question,
+            answer,
+            datetime.now().isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_favorite(
+    user_id: int,
+    question: str,
+    answer: str,
+):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO favorites
+        (user_id, question, answer, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            question,
+            answer,
+            datetime.now().isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_history(user_id: int, limit: int = 10):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT subject, question, created_at
+        FROM history
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (user_id, limit),
+    )
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return rows
 
 
 # =========================================================
 # KEYBOARDS
 # =========================================================
 
-def main_menu():
-
+def main_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
-                    text="👤 Профиль",
-                    callback_data="profile"
+                    text="🤖 ИИ-помощник",
+                    callback_data="ai",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📚 Предметы",
+                    callback_data="subjects",
                 ),
                 InlineKeyboardButton(
-                    text="🤖 AI",
-                    callback_data="ai"
-                )
+                    text="🧠 Тренировка",
+                    callback_data="training",
+                ),
             ],
-
             [
                 InlineKeyboardButton(
-                    text="🎮 Игры",
-                    callback_data="games"
+                    text="🧮 Калькулятор",
+                    callback_data="calculator",
                 ),
                 InlineKeyboardButton(
-                    text="🎁 Бонус",
-                    callback_data="bonus"
-                )
+                    text="🎯 Задание дня",
+                    callback_data="daily",
+                ),
             ],
-
             [
                 InlineKeyboardButton(
-                    text="🏆 Рейтинг",
-                    callback_data="rating"
+                    text="📊 Статистика",
+                    callback_data="stats",
                 ),
                 InlineKeyboardButton(
-                    text="👥 Рефералы",
-                    callback_data="ref"
-                )
+                    text="📖 История",
+                    callback_data="history",
+                ),
             ],
-
             [
                 InlineKeyboardButton(
-                    text="🏅 Достижения",
-                    callback_data="achievements"
-                )
+                    text="⭐ Избранное",
+                    callback_data="favorites",
+                ),
             ],
-
-            [
-                InlineKeyboardButton(
-                    text="ℹ️ Помощь",
-                    callback_data="help"
-                )
-            ]
-
         ]
     )
 
 
-def games_menu():
-
+def subjects_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-
             [
                 InlineKeyboardButton(
-                    text="🎲 Кубик",
-                    callback_data="dice"
+                    text="🧮 Математика",
+                    callback_data="math",
                 ),
                 InlineKeyboardButton(
-                    text="🪙 Монетка",
-                    callback_data="coin"
-                )
+                    text="⚛️ Физика",
+                    callback_data="physics",
+                ),
             ],
-
             [
                 InlineKeyboardButton(
-                    text="🎯 Число",
-                    callback_data="number"
-                )
+                    text="🧪 Химия",
+                    callback_data="chemistry",
+                ),
+                InlineKeyboardButton(
+                    text="📖 История",
+                    callback_data="history_subject",
+                ),
             ],
-
+            [
+                InlineKeyboardButton(
+                    text="🇷🇺 Русский",
+                    callback_data="russian",
+                ),
+                InlineKeyboardButton(
+                    text="🇬🇧 Английский",
+                    callback_data="english",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🇧🇾 Белорусский",
+                    callback_data="belarusian",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text="⬅️ Назад",
-                    callback_data="home"
+                    callback_data="home",
                 )
-            ]
-
+            ],
         ]
     )
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Главное меню",
+                    callback_data="home",
+                )
+            ]
+        ]
+    )
+
+
+# =========================================================
+# SUBJECT INFO
+# =========================================================
+
+SUBJECTS = {
+    "math": (
+        "🧮 <b>Математика</b>\n\n"
+        "Могу помочь с:\n"
+        "• алгеброй\n"
+        "• геометрией\n"
+        "• уравнениями\n"
+        "• функциями\n"
+        "• процентами\n"
+        "• дробями\n"
+        "• вероятностями\n\n"
+        "Просто отправь задачу."
+    ),
+
+    "physics": (
+        "⚛️ <b>Физика</b>\n\n"
+        "Помогу разобраться с:\n"
+        "• механикой\n"
+        "• электричеством\n"
+        "• оптикой\n"
+        "• теплотой\n"
+        "• давлением\n"
+        "• энергией\n\n"
+        "Отправь условие задачи."
+    ),
+
+    "chemistry": (
+        "🧪 <b>Химия</b>\n\n"
+        "Помогу с:\n"
+        "• реакциями\n"
+        "• формулами\n"
+        "• уравнениями\n"
+        "• молями\n"
+        "• периодической системой\n"
+        "• расчётами."
+    ),
+
+    "history_subject": (
+        "📖 <b>История</b>\n\n"
+        "Могу объяснить исторические события,\n"
+        "даты, личности и причины событий."
+    ),
+
+    "russian": (
+        "🇷🇺 <b>Русский язык</b>\n\n"
+        "Помогу с:\n"
+        "• орфографией\n"
+        "• пунктуацией\n"
+        "• грамматикой\n"
+        "• сочинениями\n"
+        "• разбором предложений."
+    ),
+
+    "english": (
+        "🇬🇧 <b>Английский язык</b>\n\n"
+        "Помогу с переводом,\n"
+        "грамматикой, временами,\n"
+        "словами и упражнениями."
+    ),
+
+    "belarusian": (
+        "🇧🇾 <b>Белорусский язык</b>\n\n"
+        "Могу помочь с грамматикой,\n"
+        "переводом, правописанием\n"
+        "и школьными заданиями."
+    ),
+}
+
+
+# =========================================================
+# SIMPLE AI WITHOUT EXTERNAL API
+# =========================================================
+
+def local_ai(question: str) -> str:
+
+    q = question.lower().strip()
+
+    if not q:
+        return "Напиши вопрос."
+
+    if "привет" in q:
+        return (
+            "👋 Привет!\n\n"
+            "Я учебный помощник. "
+            "Можешь отправить мне задачу по математике, "
+            "физике, химии, истории или языкам."
+        )
+
+    if "кто ты" in q:
+        return (
+            "🤖 Я учебный бот.\n\n"
+            "Моя задача — помочь тебе разобраться "
+            "с учебным материалом и объяснить решение."
+        )
+
+    if "формула" in q and "скорост" in q:
+        return (
+            "⚡ Формула скорости:\n\n"
+            "<code>v = s / t</code>\n\n"
+            "где:\n"
+            "v — скорость\n"
+            "s — путь\n"
+            "t — время"
+        )
+
+    if "площадь" in q and "круг" in q:
+        return (
+            "⭕ Площадь круга:\n\n"
+            "<code>S = πr²</code>\n\n"
+            "где r — радиус."
+        )
+
+    if "процент" in q:
+        return (
+            "📊 Чтобы найти процент от числа:\n\n"
+            "<code>число × процент / 100</code>\n\n"
+            "Например:\n"
+            "20% от 500 = 500 × 20 / 100 = 100."
+        )
+
+    return (
+        "🧠 <b>Разберём задачу</b>\n\n"
+        f"<b>Твой вопрос:</b>\n{escape(question)}\n\n"
+        "Сейчас я работаю в базовом режиме.\n\n"
+        "Чтобы получить полноценное ИИ-объяснение, "
+        "можно подключить AI_API_KEY в Railway.\n\n"
+        "А пока я могу помочь через разделы "
+        "«Предметы», «Тренировка» и «Калькулятор»."
+    )
+
+
+# =========================================================
+# MATH CALCULATOR
+# =========================================================
+
+def safe_calculate(expression: str):
+
+    expression = expression.replace(",", ".")
+
+    allowed = "0123456789+-*/(). "
+
+    if any(char not in allowed for char in expression):
+        return None
+
+    try:
+        result = eval(
+            expression,
+            {
+                "__builtins__": {}
+            },
+            {},
+        )
+
+        if isinstance(result, (int, float)):
+            return result
+
+    except Exception:
+        return None
+
+    return None
+
+
+# =========================================================
+# TRAINING
+# =========================================================
+
+TRAINING = {}
+
+
+def generate_question():
+
+    a = random.randint(2, 20)
+    b = random.randint(2, 20)
+
+    answer = a + b
+
+    return (
+        f"🧠 <b>Тренировка</b>\n\n"
+        f"Сколько будет:\n\n"
+        f"<b>{a} + {b}</b> ?"
+    ), answer
+
+
+# =========================================================
+# DAILY
+# =========================================================
+
+DAILY_TASKS = [
+    (
+        "🧮 <b>Задание дня</b>\n\n"
+        "Если 20% от числа равны 40, "
+        "чему равно число?"
+    ),
+    (
+        "⚛️ <b>Задание дня</b>\n\n"
+        "Как называется сила, с которой "
+        "тело притягивается к Земле?"
+    ),
+    (
+        "📖 <b>Задание дня</b>\n\n"
+        "Что такое историческое событие?"
+    ),
+    (
+        "🇬🇧 <b>Задание дня</b>\n\n"
+        "Переведи слово <b>school</b>."
+    ),
+]
+
+
+# =========================================================
+# BOT
+# =========================================================
+
+dp = Dispatcher()
 
 
 # =========================================================
@@ -281,471 +679,28 @@ def games_menu():
 @dp.message(CommandStart())
 async def start(message: Message):
 
-    await create_user(message)
+    create_user(
+        message.from_user.id,
+        message.from_user.full_name,
+    )
+
+    update_streak(message.from_user.id)
+    add_xp(message.from_user.id, 5)
 
     await message.answer(
-        f"""
-<b>🚀 Добро пожаловать, {message.from_user.first_name}!</b>
-
-Это твой личный бот с AI, играми,
-профилем, XP, достижениями и рейтингом.
-
-Выбирай нужный раздел ниже 👇
-        """,
-        reply_markup=main_menu()
-    )
-
-
-# =========================================================
-# PROFILE
-# =========================================================
-
-@dp.callback_query(F.data == "profile")
-async def profile(callback: CallbackQuery):
-
-    user = await get_user(callback.from_user.id)
-
-    if not user:
-        await callback.answer("Сначала нажми /start")
-        return
-
-    (
-        uid,
-        username,
-        first_name,
-        balance,
-        xp,
-        level,
-        games,
-        referrals,
-        streak,
-        last_bonus,
-        joined
-    ) = user
-
-    await callback.message.edit_text(
-        f"""
-<b>👤 ТВОЙ ПРОФИЛЬ</b>
-
-🆔 ID: <code>{uid}</code>
-👤 Имя: {first_name}
-
-⭐ Уровень: <b>{level}</b>
-✨ XP: <b>{xp}</b>
-💰 Монеты: <b>{balance}</b>
-
-🎮 Игр сыграно: {games}
-👥 Рефералов: {referrals}
-🔥 Серия бонусов: {streak}
-        """,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# BONUS
-# =========================================================
-
-@dp.callback_query(F.data == "bonus")
-async def bonus(callback: CallbackQuery):
-
-    user_id = callback.from_user.id
-
-    user = await get_user(user_id)
-
-    if not user:
-        await callback.answer("Ошибка")
-        return
-
-    last_bonus = user[9]
-
-    today = date.today().isoformat()
-
-    if last_bonus == today:
-
-        await callback.answer(
-            "🎁 Ты уже получил сегодняшний бонус!",
-            show_alert=True
-        )
-
-        return
-
-    reward = random.randint(50, 150)
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-            UPDATE users
-            SET balance = balance + ?,
-                xp = xp + ?,
-                last_bonus = ?,
-                streak = streak + 1
-            WHERE id = ?
-        """, (
-            reward,
-            10,
-            today,
-            user_id
-        ))
-
-        await db.commit()
-
-    await callback.message.edit_text(
-        f"""
-<b>🎁 ЕЖЕДНЕВНОЙ БОНУС</b>
-
-Ты получил:
-
-💰 <b>+{reward}</b> монет
-✨ <b>+10 XP</b>
-
-Заходи завтра за новым бонусом 🔥
-        """,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# GAMES
-# =========================================================
-
-@dp.callback_query(F.data == "games")
-async def games(callback: CallbackQuery):
-
-    await callback.message.edit_text(
-        """
-<b>🎮 ИГРЫ</b>
-
-Выбери игру:
-        """,
-        reply_markup=games_menu()
-    )
-
-    await callback.answer()
-
-
-async def game_played(user_id):
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        await db.execute("""
-            UPDATE users
-            SET games = games + 1
-            WHERE id = ?
-        """, (user_id,))
-
-        await db.commit()
-
-    await add_xp(user_id, 5)
-
-
-@dp.callback_query(F.data == "dice")
-async def dice(callback: CallbackQuery):
-
-    result = random.randint(1, 6)
-
-    reward = result * 5
-
-    await add_balance(
-        callback.from_user.id,
-        reward
-    )
-
-    await game_played(
-        callback.from_user.id
-    )
-
-    await callback.message.edit_text(
-        f"""
-🎲 <b>КУБИК</b>
-
-Выпало: <b>{result}</b>
-
-💰 Награда: <b>+{reward}</b> монет
-✨ +5 XP
-        """,
-        reply_markup=games_menu()
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "coin")
-async def coin(callback: CallbackQuery):
-
-    result = random.choice(
-        ["ОРЁЛ", "РЕШКА"]
-    )
-
-    reward = 25
-
-    await add_balance(
-        callback.from_user.id,
-        reward
-    )
-
-    await game_played(
-        callback.from_user.id
-    )
-
-    await callback.message.edit_text(
-        f"""
-🪙 <b>МОНЕТКА</b>
-
-Выпало: <b>{result}</b>
-
-💰 +{reward} монет
-✨ +5 XP
-        """,
-        reply_markup=games_menu()
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "number")
-async def number(callback: CallbackQuery):
-
-    secret = random.randint(1, 10)
-
-    await add_balance(
-        callback.from_user.id,
-        secret * 3
-    )
-
-    await game_played(
-        callback.from_user.id
-    )
-
-    await callback.message.edit_text(
-        f"""
-🎯 <b>СЛУЧАЙНОЕ ЧИСЛО</b>
-
-Твоё число: <b>{secret}</b>
-
-💰 +{secret * 3} монет
-✨ +5 XP
-        """,
-        reply_markup=games_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# RATING
-# =========================================================
-
-@dp.callback_query(F.data == "rating")
-async def rating(callback: CallbackQuery):
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        cur = await db.execute("""
-            SELECT first_name, xp, level
-            FROM users
-            ORDER BY xp DESC
-            LIMIT 10
-        """)
-
-        users = await cur.fetchall()
-
-    text = "<b>🏆 ТОП 10</b>\n\n"
-
-    if not users:
-        text += "Пока никого нет."
-    else:
-
-        for i, user in enumerate(users, 1):
-
-            name, xp, level = user
-
-            text += (
-                f"<b>{i}.</b> {name} "
-                f"— ⭐ {level} "
-                f"({xp} XP)\n"
-            )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# REFERRALS
-# =========================================================
-
-@dp.callback_query(F.data == "ref")
-async def referrals(callback: CallbackQuery):
-
-    me = await bot.get_me()
-
-    link = (
-        f"https://t.me/{me.username}"
-        f"?start=ref_{callback.from_user.id}"
-    )
-
-    user = await get_user(
-        callback.from_user.id
-    )
-
-    referrals_count = user[7] if user else 0
-
-    await callback.message.edit_text(
-        f"""
-<b>👥 РЕФЕРАЛЬНАЯ СИСТЕМА</b>
-
-Приглашай друзей и получай бонусы.
-
-Твоя ссылка:
-
-<code>{link}</code>
-
-👥 Приглашено: <b>{referrals_count}</b>
-💰 Награда: <b>100 монет</b> за нового пользователя
-        """,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# ACHIEVEMENTS
-# =========================================================
-
-@dp.callback_query(F.data == "achievements")
-async def achievements(callback: CallbackQuery):
-
-    user = await get_user(
-        callback.from_user.id
-    )
-
-    if not user:
-        await callback.answer()
-        return
-
-    xp = user[4]
-    games = user[6]
-    referrals = user[7]
-
-    achievements_list = []
-
-    if xp >= 100:
-        achievements_list.append("⭐ 100 XP")
-
-    if games >= 10:
-        achievements_list.append("🎮 10 игр")
-
-    if referrals >= 5:
-        achievements_list.append("👥 5 рефералов")
-
-    if not achievements_list:
-        achievements_list.append(
-            "🔒 Пока нет достижений"
-        )
-
-    text = (
-        "<b>🏅 ДОСТИЖЕНИЯ</b>\n\n"
-        + "\n".join(achievements_list)
-    )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-# =========================================================
-# AI
-# =========================================================
-
-@dp.callback_query(F.data == "ai")
-async def ai_button(callback: CallbackQuery):
-
-    await callback.message.edit_text(
-        """
-<b>🤖 AI-ПОМОЩНИК</b>
-
-Напиши сообщение командой:
-
-<code>/ai твой вопрос</code>
-
-Например:
-
-<code>/ai Объясни мне Python простыми словами</code>
-
-Для выхода:
-<code>/cancel</code>
-        """,
-        reply_markup=main_menu()
-    )
-
-    await callback.answer()
-
-
-@dp.message(Command("ai"))
-async def ai_command(message: Message):
-
-    if not AI_API_KEY:
-
-        await message.answer(
-            """
-🤖 <b>AI пока не настроен.</b>
-
-Добавь <code>AI_API_KEY</code>
-в переменные окружения Railway.
-            """
-        )
-
-        return
-
-    question = message.text.replace(
-        "/ai",
-        "",
-        1
-    ).strip()
-
-    if not question:
-
-        await message.answer(
-            "Напиши вопрос после /ai"
-        )
-
-        return
-
-    # Здесь можно подключить API выбранной
-    # AI-модели.
-    #
-    # Бот специально не содержит ключ внутри кода.
-    #
-    # Это место предназначено для API-запроса.
-
-    await message.answer(
-        """
-🤖 AI получил твой запрос.
-
-Для подключения реальных ответов
-нужно указать API-провайдера и его API endpoint.
-        """
-    )
-
-
-@dp.message(Command("cancel"))
-async def cancel(message: Message):
-
-    await message.answer(
-        "✅ Режим AI закрыт.",
-        reply_markup=main_menu()
+        "🚀 <b>STUDY AI</b>\n\n"
+        f"Привет, <b>{escape(message.from_user.first_name)}</b>!\n\n"
+        "Я твой учебный помощник.\n\n"
+        "📚 Решение задач\n"
+        "🧠 Объяснение тем\n"
+        "🎯 Тренировки\n"
+        "📊 Статистика\n"
+        "🏆 Уровни и XP\n"
+        "📖 История запросов\n"
+        "⭐ Избранное\n"
+        "🧮 Калькулятор\n\n"
+        "Выбирай действие:",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -753,170 +708,513 @@ async def cancel(message: Message):
 # HELP
 # =========================================================
 
-@dp.callback_query(F.data == "help")
-async def help_button(callback: CallbackQuery):
+@dp.message(Command("help"))
+async def help_command(message: Message):
 
-    await callback.message.edit_text(
-        """
-<b>ℹ️ ПОМОЩЬ</b>
-
-Основные возможности:
-
-👤 Профиль
-🎁 Ежедневные бонусы
-🎮 Мини-игры
-🏆 Рейтинг
-👥 Реферальная система
-🏅 Достижения
-🤖 AI
-
-Команды:
-
-/start — главное меню
-/ai — AI
-/cancel — отменить AI
-        """,
-        reply_markup=main_menu()
+    await message.answer(
+        "ℹ️ <b>Помощь</b>\n\n"
+        "/start — главное меню\n"
+        "/help — помощь\n"
+        "/stats — статистика\n"
+        "/history — история\n"
+        "/daily — задание дня\n\n"
+        "Также можешь просто написать мне вопрос."
     )
-
-    await callback.answer()
 
 
 # =========================================================
-# HOME
+# STATS COMMAND
+# =========================================================
+
+@dp.message(Command("stats"))
+async def stats_command(message: Message):
+
+    user = get_user(message.from_user.id)
+
+    if not user:
+        create_user(
+            message.from_user.id,
+            message.from_user.full_name,
+        )
+        user = get_user(message.from_user.id)
+
+    _, name, xp, level, questions, correct, streak, _ = user
+
+    accuracy = 0
+
+    if questions:
+        accuracy = int(correct / questions * 100)
+
+    await message.answer(
+        "📊 <b>Твоя статистика</b>\n\n"
+        f"👤 {escape(name)}\n"
+        f"⭐ XP: <b>{xp}</b>\n"
+        f"🏆 Уровень: <b>{level}</b>\n"
+        f"📚 Запросов: <b>{questions}</b>\n"
+        f"✅ Правильных: <b>{correct}</b>\n"
+        f"🎯 Точность: <b>{accuracy}%</b>\n"
+        f"🔥 Серия дней: <b>{streak}</b>",
+        reply_markup=back_keyboard(),
+    )
+
+
+# =========================================================
+# HISTORY COMMAND
+# =========================================================
+
+@dp.message(Command("history"))
+async def history_command(message: Message):
+
+    rows = get_history(
+        message.from_user.id,
+        10,
+    )
+
+    if not rows:
+        await message.answer(
+            "📖 История пока пустая.",
+            reply_markup=back_keyboard(),
+        )
+        return
+
+    text = "📖 <b>Последние запросы</b>\n\n"
+
+    for i, row in enumerate(rows, 1):
+
+        subject, question, created = row
+
+        short = question[:100]
+
+        text += (
+            f"<b>{i}.</b> "
+            f"{escape(subject)}\n"
+            f"{escape(short)}\n\n"
+        )
+
+    await message.answer(
+        text,
+        reply_markup=back_keyboard(),
+    )
+
+
+# =========================================================
+# DAILY COMMAND
+# =========================================================
+
+@dp.message(Command("daily"))
+async def daily_command(message: Message):
+
+    task = DAILY_TASKS[
+        datetime.now().day % len(DAILY_TASKS)
+    ]
+
+    await message.answer(
+        task,
+        reply_markup=back_keyboard(),
+    )
+
+
+# =========================================================
+# CALLBACKS
 # =========================================================
 
 @dp.callback_query(F.data == "home")
-async def home(callback: CallbackQuery):
+async def callback_home(callback: CallbackQuery):
 
     await callback.message.edit_text(
-        """
-<b>🏠 ГЛАВНОЕ МЕНЮ</b>
+        "🏠 <b>Главное меню</b>\n\n"
+        "Выбирай нужный раздел:",
+        reply_markup=main_keyboard(),
+    )
 
-Выбирай нужный раздел 👇
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "subjects")
+async def callback_subjects(callback: CallbackQuery):
+
+    await callback.message.edit_text(
+        "📚 <b>Предметы</b>\n\n"
+        "Выбери предмет:",
+        reply_markup=subjects_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_(SUBJECTS.keys()))
+async def callback_subject(callback: CallbackQuery):
+
+    subject = callback.data
+
+    await callback.message.edit_text(
+        SUBJECTS[subject],
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "stats")
+async def callback_stats(callback: CallbackQuery):
+
+    user = get_user(callback.from_user.id)
+
+    if not user:
+        create_user(
+            callback.from_user.id,
+            callback.from_user.full_name,
+        )
+        user = get_user(callback.from_user.id)
+
+    _, name, xp, level, questions, correct, streak, _ = user
+
+    accuracy = 0
+
+    if questions:
+        accuracy = int(correct / questions * 100)
+
+    await callback.message.edit_text(
+        "📊 <b>Статистика</b>\n\n"
+        f"👤 {escape(name)}\n"
+        f"⭐ XP: {xp}\n"
+        f"🏆 Уровень: {level}\n"
+        f"📚 Запросов: {questions}\n"
+        f"✅ Правильных: {correct}\n"
+        f"🎯 Точность: {accuracy}%\n"
+        f"🔥 Серия: {streak} дней",
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "history")
+async def callback_history(callback: CallbackQuery):
+
+    rows = get_history(
+        callback.from_user.id,
+        10,
+    )
+
+    if not rows:
+
+        await callback.message.edit_text(
+            "📖 <b>История</b>\n\n"
+            "Пока здесь ничего нет.",
+            reply_markup=back_keyboard(),
+        )
+
+        await callback.answer()
+        return
+
+    text = "📖 <b>История запросов</b>\n\n"
+
+    for i, row in enumerate(rows, 1):
+
+        subject, question, created = row
+
+        text += (
+            f"<b>{i}.</b> "
+            f"{escape(subject)}\n"
+            f"{escape(question[:100])}\n\n"
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "favorites")
+async def callback_favorites(callback: CallbackQuery):
+
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT question, answer
+        FROM favorites
+        WHERE user_id = ?
+        ORDER BY id DESC
+        LIMIT 5
         """,
-        reply_markup=main_menu()
+        (callback.from_user.id,),
+    )
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    if not rows:
+
+        await callback.message.edit_text(
+            "⭐ <b>Избранное</b>\n\n"
+            "Здесь пока ничего нет.",
+            reply_markup=back_keyboard(),
+        )
+
+        await callback.answer()
+        return
+
+    text = "⭐ <b>Избранное</b>\n\n"
+
+    for i, (question, answer) in enumerate(rows, 1):
+
+        text += (
+            f"<b>{i}.</b> "
+            f"{escape(question[:100])}\n\n"
+        )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "calculator")
+async def callback_calculator(callback: CallbackQuery):
+
+    await callback.message.edit_text(
+        "🧮 <b>Калькулятор</b>\n\n"
+        "Напиши пример обычным сообщением.\n\n"
+        "Например:\n"
+        "<code>125 * 4 + 20</code>\n\n"
+        "Поддерживаются:\n"
+        "+  −  ×  ÷  ( )",
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "training")
+async def callback_training(callback: CallbackQuery):
+
+    question, answer = generate_question()
+
+    TRAINING[callback.from_user.id] = answer
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Ответить",
+                    callback_data="answer_training",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 Другое",
+                    callback_data="training",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data="home",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        question,
+        reply_markup=keyboard,
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "answer_training")
+async def callback_answer_training(
+    callback: CallbackQuery,
+):
+
+    answer = TRAINING.get(
+        callback.from_user.id
+    )
+
+    if answer is None:
+
+        await callback.answer(
+            "Сначала получи задание.",
+            show_alert=True,
+        )
+
+        return
+
+    await callback.message.edit_text(
+        "✏️ <b>Напиши свой ответ числом.</b>",
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "daily")
+async def callback_daily(callback: CallbackQuery):
+
+    task = DAILY_TASKS[
+        datetime.now().day % len(DAILY_TASKS)
+    ]
+
+    await callback.message.edit_text(
+        task,
+        reply_markup=back_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ai")
+async def callback_ai(callback: CallbackQuery):
+
+    await callback.message.edit_text(
+        "🤖 <b>ИИ-помощник</b>\n\n"
+        "Просто отправь мне сообщение.\n\n"
+        "Например:\n"
+        "• Реши 2x + 5 = 17\n"
+        "• Объясни закон Ома\n"
+        "• Что такое фотосинтез?\n"
+        "• Переведи текст\n"
+        "• Помоги написать сочинение",
+        reply_markup=back_keyboard(),
     )
 
     await callback.answer()
 
 
 # =========================================================
-# ADMIN
+# TEXT HANDLER
 # =========================================================
 
-def is_admin(user_id):
+@dp.message(F.text)
+async def text_handler(message: Message):
 
-    return ADMIN_ID != 0 and user_id == ADMIN_ID
+    user_id = message.from_user.id
+    text = message.text.strip()
 
-
-@dp.message(Command("admin"))
-async def admin(message: Message):
-
-    if not is_admin(message.from_user.id):
-
-        await message.answer(
-            "⛔ Доступ запрещён."
-        )
-
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM users"
-        )
-
-        total = (await cur.fetchone())[0]
-
-        cur = await db.execute(
-            "SELECT SUM(balance) FROM users"
-        )
-
-        total_balance = (await cur.fetchone())[0] or 0
-
-    await message.answer(
-        f"""
-<b>🛠 ADMIN PANEL</b>
-
-👥 Пользователей: <b>{total}</b>
-💰 Всего монет: <b>{total_balance}</b>
-
-Команды:
-
-/users — пользователи
-/give ID количество — выдать монеты
-        """
-    )
-
-
-@dp.message(Command("users"))
-async def users_command(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-
-        cur = await db.execute("""
-            SELECT id, first_name, balance, xp
-            FROM users
-            ORDER BY xp DESC
-            LIMIT 20
-        """)
-
-        users = await cur.fetchall()
-
-    text = "<b>👥 USERS</b>\n\n"
-
-    for user in users:
-
-        uid, name, balance, xp = user
-
-        text += (
-            f"<code>{uid}</code> "
-            f"{name} | 💰{balance} | XP {xp}\n"
-        )
-
-    await message.answer(text)
-
-
-@dp.message(Command("give"))
-async def give_command(message: Message):
-
-    if not is_admin(message.from_user.id):
-        return
-
-    args = message.text.split()
-
-    if len(args) != 3:
-
-        await message.answer(
-            "/give ID количество"
-        )
-
-        return
-
-    try:
-
-        user_id = int(args[1])
-        amount = int(args[2])
-
-    except ValueError:
-
-        await message.answer(
-            "❌ Неверные числа."
-        )
-
-        return
-
-    await add_balance(
+    create_user(
         user_id,
-        amount
+        message.from_user.full_name,
+    )
+
+    update_streak(user_id)
+
+    # -----------------------------------------------------
+    # TRAINING ANSWER
+    # -----------------------------------------------------
+
+    if user_id in TRAINING:
+
+        expected = TRAINING[user_id]
+
+        try:
+            user_answer = float(
+                text.replace(",", ".")
+            )
+
+            if user_answer == expected:
+
+                register_question(user_id)
+                register_correct(user_id)
+                add_xp(user_id, 20)
+
+                del TRAINING[user_id]
+
+                await message.answer(
+                    "🎉 <b>Правильно!</b>\n\n"
+                    "Ты получил <b>+20 XP</b> ⭐",
+                    reply_markup=main_keyboard(),
+                )
+
+                return
+
+            else:
+
+                register_question(user_id)
+                add_xp(user_id, 5)
+
+                del TRAINING[user_id]
+
+                await message.answer(
+                    f"❌ Неправильно.\n\n"
+                    f"Правильный ответ: "
+                    f"<b>{expected}</b>\n\n"
+                    "Ты получил +5 XP за попытку.",
+                    reply_markup=main_keyboard(),
+                )
+
+                return
+
+        except ValueError:
+            pass
+
+    # -----------------------------------------------------
+    # CALCULATOR
+    # -----------------------------------------------------
+
+    if any(
+        symbol in text
+        for symbol in ["+", "-", "*", "/"]
+    ):
+
+        result = safe_calculate(text)
+
+        if result is not None:
+
+            register_question(user_id)
+            add_xp(user_id, 5)
+
+            await message.answer(
+                "🧮 <b>Ответ:</b>\n\n"
+                f"<code>{escape(text)}</code>"
+                f" = <b>{result}</b>\n\n"
+                "+5 XP ⭐",
+                reply_markup=main_keyboard(),
+            )
+
+            return
+
+    # -----------------------------------------------------
+    # AI / GENERAL
+    # -----------------------------------------------------
+
+    register_question(user_id)
+    add_xp(user_id, 5)
+
+    answer = local_ai(text)
+
+    save_history(
+        user_id,
+        "AI",
+        text,
+        answer,
     )
 
     await message.answer(
-        f"✅ Пользователю {user_id} начислено {amount} монет."
+        answer,
+        reply_markup=main_keyboard(),
+    )
+
+
+# =========================================================
+# UNKNOWN CONTENT
+# =========================================================
+
+@dp.message()
+async def unknown_message(message: Message):
+
+    await message.answer(
+        "🤔 Я пока умею работать с текстовыми сообщениями.\n\n"
+        "Напиши задачу или используй меню.",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -925,29 +1223,56 @@ async def give_command(message: Message):
 # =========================================================
 
 @dp.errors()
-async def errors_handler(event):
+async def global_error_handler(event):
 
-    logging.exception(
-        "Bot error: %s",
-        event.exception
+    logger.exception(
+        "Unhandled error: %s",
+        event.exception,
     )
+
+    try:
+        if event.update.message:
+            await event.update.message.answer(
+                "⚠️ Произошла внутренняя ошибка.\n"
+                "Попробуй ещё раз."
+            )
+    except Exception:
+        pass
+
+    return True
 
 
 # =========================================================
-# RUN
+# START BOT
 # =========================================================
 
 async def main():
 
-    await init_db()
+    init_db()
 
-    logging.info(
-        "BOT STARTED"
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+        ),
     )
 
-    await dp.start_polling(
-        bot
-    )
+    logger.info("Starting STUDY AI...")
+
+    try:
+
+        await bot.delete_webhook(
+            drop_pending_updates=True
+        )
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+
+    finally:
+
+        await bot.session.close()
 
 
 if __name__ == "__main__":
@@ -957,14 +1282,6 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        logging.info
-            "BOT STOPPED"
-
-### Переменные в Railway
-
-В **Variables** добавь:
-
-```text
-BOT_TOKEN=токен_от_BotFather
-ADMIN_ID=твой_Telegram_ID
-AI_API_KEY=твой_AI_API_ключ
+        logger.info(
+            "Bot stopped by user."
+        )
