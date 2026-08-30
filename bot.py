@@ -1,22 +1,19 @@
 import asyncio
 import logging
 import os
-import random
 import sqlite3
-from datetime import datetime, date
-from html import escape
+import time
+from contextlib import closing
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ChatType
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message,
     CallbackQuery,
-    InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
-
 
 # =========================================================
 # CONFIG
@@ -24,19 +21,19 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# AI_API_KEY можно добавить позже.
-# Бот будет работать и БЕЗ него.
-AI_API_KEY = os.getenv("AI_API_KEY")
+# Необязательно.
+# Если добавишь ADMIN_ID в Railway Variables,
+# бот будет отправлять админу жалобы и статистику.
+ADMIN_ID_RAW = os.getenv("ADMIN_ID")
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW and ADMIN_ID_RAW.isdigit() else None
 
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Railway Variables."
-    )
+DB_FILE = os.getenv("DB_FILE", "chatroulette.db")
 
+# Через сколько секунд неактивный поиск считается устаревшим
+QUEUE_TIMEOUT = 30 * 60
 
-# =========================================================
-# LOGGING
-# =========================================================
+# Минимальный интервал между обычными сообщениями
+MESSAGE_COOLDOWN = 0.7
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,296 +42,357 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN не найден. Добавь BOT_TOKEN в Railway → Variables."
+    )
+
+
+# =========================================================
+# BOT
+# =========================================================
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+
+# Защищает операции с очередью/парами от одновременных запросов
+state_lock = asyncio.Lock()
+
+# Последнее время отправки сообщения пользователем
+last_message_time = {}
+
 
 # =========================================================
 # DATABASE
 # =========================================================
-
-DB_FILE = "studybot.db"
-
 
 def db():
     return sqlite3.connect(DB_FILE)
 
 
 def init_db():
-    conn = db()
-    cur = conn.cursor()
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            name TEXT,
-            xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
-            questions INTEGER DEFAULT 0,
-            correct INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0,
-            last_day TEXT
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                joined_at INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                messages_sent INTEGER DEFAULT 0,
+                messages_received INTEGER DEFAULT 0,
+                reports INTEGER DEFAULT 0,
+                banned INTEGER DEFAULT 0
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS queue (
+                user_id INTEGER PRIMARY KEY,
+                joined_at INTEGER NOT NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pairs (
+                user1 INTEGER PRIMARY KEY,
+                user2 INTEGER NOT NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blocks (
+                user_id INTEGER NOT NULL,
+                blocked_id INTEGER NOT NULL,
+                PRIMARY KEY (user_id, blocked_id)
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter INTEGER NOT NULL,
+                reported INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        conn.commit()
+
+
+def ensure_user(user_id: int):
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user_id,),
         )
-    """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            subject TEXT,
-            question TEXT,
-            answer TEXT,
-            created_at TEXT
+        exists = cur.fetchone()
+
+        if exists:
+            cur.execute(
+                """
+                UPDATE users
+                SET last_seen = ?
+                WHERE user_id = ?
+                """,
+                (now, user_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO users
+                (user_id, joined_at, last_seen)
+                VALUES (?, ?, ?)
+                """,
+                (user_id, now, now),
+            )
+
+        conn.commit()
+
+
+def is_banned(user_id: int) -> bool:
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT banned FROM users WHERE user_id = ?",
+            (user_id,),
         )
-    """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            question TEXT,
-            answer TEXT,
-            created_at TEXT
+        row = cur.fetchone()
+
+        return bool(row and row[0])
+
+
+def get_partner(user_id: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT user2 FROM pairs WHERE user1 = ?",
+            (user_id,),
         )
-    """)
 
-    conn.commit()
-    conn.close()
+        row = cur.fetchone()
+
+        if row:
+            return row[0]
+
+        cur.execute(
+            "SELECT user1 FROM pairs WHERE user2 = ?",
+            (user_id,),
+        )
+
+        row = cur.fetchone()
+
+        if row:
+            return row[0]
+
+        return None
 
 
-def create_user(user_id: int, name: str):
-    conn = db()
-    cur = conn.cursor()
+def add_pair(user1: int, user2: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    cur.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user_id,),
-    )
+        cur.execute(
+            "DELETE FROM queue WHERE user_id IN (?, ?)",
+            (user1, user2),
+        )
 
-    if not cur.fetchone():
+        cur.execute(
+            "INSERT OR REPLACE INTO pairs (user1, user2) VALUES (?, ?)",
+            (user1, user2),
+        )
+
+        conn.commit()
+
+
+def remove_pair(user_id: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
         cur.execute(
             """
-            INSERT INTO users
-            (user_id, name, xp, level, questions, correct, streak, last_day)
-            VALUES (?, ?, 0, 1, 0, 0, 0, '')
+            DELETE FROM pairs
+            WHERE user1 = ? OR user2 = ?
             """,
-            (user_id, name),
+            (user_id, user_id),
         )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
-def get_user(user_id: int):
-    conn = db()
-    cur = conn.cursor()
+def add_to_queue(user_id: int):
+    now = int(time.time())
 
-    cur.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,),
-    )
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    row = cur.fetchone()
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO queue
+            (user_id, joined_at)
+            VALUES (?, ?)
+            """,
+            (user_id, now),
+        )
 
-    conn.close()
-
-    return row
+        conn.commit()
 
 
-def add_xp(user_id: int, amount: int):
-    conn = db()
-    cur = conn.cursor()
+def remove_from_queue(user_id: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    cur.execute(
-        """
-        UPDATE users
-        SET xp = xp + ?
-        WHERE user_id = ?
-        """,
-        (amount, user_id),
-    )
+        cur.execute(
+            "DELETE FROM queue WHERE user_id = ?",
+            (user_id,),
+        )
 
-    cur.execute(
-        "SELECT xp FROM users WHERE user_id = ?",
-        (user_id,),
-    )
+        conn.commit()
 
-    row = cur.fetchone()
 
-    if row:
-        xp = row[0]
-        level = xp // 100 + 1
+def get_queue_users():
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT user_id
+            FROM queue
+            ORDER BY joined_at ASC
+            """
+        )
+
+        return [row[0] for row in cur.fetchall()]
+
+
+def cleanup_queue():
+    cutoff = int(time.time()) - QUEUE_TIMEOUT
+
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "DELETE FROM queue WHERE joined_at < ?",
+            (cutoff,),
+        )
+
+        conn.commit()
+
+
+def are_blocked(user1: int, user2: int) -> bool:
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT 1
+            FROM blocks
+            WHERE user_id = ? AND blocked_id = ?
+            """,
+            (user1, user2),
+        )
+
+        return cur.fetchone() is not None
+
+
+def block_user(user_id: int, blocked_id: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO blocks
+            (user_id, blocked_id)
+            VALUES (?, ?)
+            """,
+            (user_id, blocked_id),
+        )
+
+        conn.commit()
+
+
+def add_report(reporter: int, reported: int):
+    now = int(time.time())
+
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            INSERT INTO reports
+            (reporter, reported, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (reporter, reported, now),
+        )
 
         cur.execute(
             """
             UPDATE users
-            SET level = ?
+            SET reports = reports + 1
             WHERE user_id = ?
             """,
-            (level, user_id),
+            (reporter,),
         )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
-def register_question(user_id: int):
-    conn = db()
-    cur = conn.cursor()
+def add_message_stats(sender: int, receiver: int):
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    cur.execute(
-        """
-        UPDATE users
-        SET questions = questions + 1
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    )
+        cur.execute(
+            """
+            UPDATE users
+            SET messages_sent = messages_sent + 1
+            WHERE user_id = ?
+            """,
+            (sender,),
+        )
 
-    conn.commit()
-    conn.close()
+        cur.execute(
+            """
+            UPDATE users
+            SET messages_received = messages_received + 1
+            WHERE user_id = ?
+            """,
+            (receiver,),
+        )
 
-
-def register_correct(user_id: int):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        UPDATE users
-        SET correct = correct + 1
-        WHERE user_id = ?
-        """,
-        (user_id,),
-    )
-
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
-def update_streak(user_id: int):
-    today = date.today().isoformat()
+def get_stats():
+    with closing(db()) as conn:
+        cur = conn.cursor()
 
-    conn = db()
-    cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        users = cur.fetchone()[0]
 
-    cur.execute(
-        "SELECT last_day, streak FROM users WHERE user_id = ?",
-        (user_id,),
-    )
+        cur.execute("SELECT COUNT(*) FROM queue")
+        queue = cur.fetchone()[0]
 
-    row = cur.fetchone()
+        cur.execute("SELECT COUNT(*) FROM pairs")
+        pairs = cur.fetchone()[0]
 
-    if not row:
-        conn.close()
-        return
+        cur.execute("SELECT COUNT(*) FROM reports")
+        reports = cur.fetchone()[0]
 
-    last_day, streak = row
+        cur.execute(
+            "SELECT COALESCE(SUM(messages_sent), 0) FROM users"
+        )
+        messages = cur.fetchone()[0]
 
-    if last_day == today:
-        conn.close()
-        return
-
-    if last_day:
-        try:
-            old = date.fromisoformat(last_day)
-            diff = (date.today() - old).days
-
-            if diff == 1:
-                streak += 1
-            else:
-                streak = 1
-
-        except Exception:
-            streak = 1
-
-    else:
-        streak = 1
-
-    cur.execute(
-        """
-        UPDATE users
-        SET streak = ?, last_day = ?
-        WHERE user_id = ?
-        """,
-        (streak, today, user_id),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def save_history(
-    user_id: int,
-    subject: str,
-    question: str,
-    answer: str,
-):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO history
-        (user_id, subject, question, answer, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            subject,
-            question,
-            answer,
-            datetime.now().isoformat(),
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def save_favorite(
-    user_id: int,
-    question: str,
-    answer: str,
-):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO favorites
-        (user_id, question, answer, created_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            question,
-            answer,
-            datetime.now().isoformat(),
-        ),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_history(user_id: int, limit: int = 10):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT subject, question, created_at
-        FROM history
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    )
-
-    rows = cur.fetchall()
-
-    conn.close()
-
-    return rows
+        return users, queue, pairs, reports, messages
 
 
 # =========================================================
@@ -346,330 +404,244 @@ def main_keyboard():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🤖 ИИ-помощник",
-                    callback_data="ai",
+                    text="🔎 Найти собеседника",
+                    callback_data="find",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📚 Предметы",
-                    callback_data="subjects",
-                ),
-                InlineKeyboardButton(
-                    text="🧠 Тренировка",
-                    callback_data="training",
-                
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧮 Калькулятор",
-                    callback_data="calculator",
-                ),
-                InlineKeyboardButton(
-                    text="🎯 Задание дня",
-                    callback_data="daily",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Статистика",
-                    callback_data="stats",
-                ),
-                InlineKeyboardButton(
-                    text="📖 История",
-                    callback_data="history",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⭐ Избранное",
-                    callback_data="favorites",
-                ),
-            ],
-        ]
-    )
-
-
-def subjects_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🧮 Математика",
-                    callback_data="math",
-                ),
-                InlineKeyboardButton(
-                    text="⚛️ Физика",
-                    callback_data="physics",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧪 Химия",
-                    callback_data="chemistry",
-                ),
-                InlineKeyboardButton(
-                    text="📖 История",
-                    callback_data="history_subject",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇷🇺 Русский",
-                    callback_data="russian",
-                ),
-                InlineKeyboardButton(
-                    text="🇬🇧 Английский",
-                    callback_data="english",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🇧🇾 Белорусский",
-                    callback_data="belarusian",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="home",
+                    text="ℹ️ Как это работает",
+                    callback_data="help",
                 )
             ],
         ]
     )
 
 
-def back_keyboard():
+def searching_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Главное меню",
-                    callback_data="home",
+                    text="❌ Остановить поиск",
+                    callback_data="stop_search",
                 )
             ]
         ]
     )
 
 
-# =========================================================
-# SUBJECT INFO
-# =========================================================
-
-SUBJECTS = {
-    "math": (
-        "🧮 <b>Математика</b>\n\n"
-        "Могу помочь с:\n"
-        "• алгеброй\n"
-        "• геометрией\n"
-        "• уравнениями\n"
-        "• функциями\n"
-        "• процентами\n"
-        "• дробями\n"
-        "• вероятностями\n\n"
-        "Просто отправь задачу."
-    ),
-
-    "physics": (
-        "⚛️ <b>Физика</b>\n\n"
-        "Помогу разобраться с:\n"
-        "• механикой\n"
-        "• электричеством\n"
-        "• оптикой\n"
-        "• теплотой\n"
-        "• давлением\n"
-        "• энергией\n\n"
-        "Отправь условие задачи."
-    ),
-
-    "chemistry": (
-        "🧪 <b>Химия</b>\n\n"
-        "Помогу с:\n"
-        "• реакциями\n"
-        "• формулами\n"
-        "• уравнениями\n"
-        "• молями\n"
-        "• периодической системой\n"
-        "• расчётами."
-    ),
-
-    "history_subject": (
-        "📖 <b>История</b>\n\n"
-        "Могу объяснить исторические события,\n"
-        "даты, личности и причины событий."
-    ),
-
-    "russian": (
-        "🇷🇺 <b>Русский язык</b>\n\n"
-        "Помогу с:\n"
-        "• орфографией\n"
-        "• пунктуацией\n"
-        "• грамматикой\n"
-        "• сочинениями\n"
-        "• разбором предложений."
-    ),
-
-    "english": (
-        "🇬🇧 <b>Английский язык</b>\n\n"
-        "Помогу с переводом,\n"
-        "грамматикой, временами,\n"
-        "словами и упражнениями."
-    ),
-
-    "belarusian": (
-        "🇧🇾 <b>Белорусский язык</b>\n\n"
-        "Могу помочь с грамматикой,\n"
-        "переводом, правописанием\n"
-        "и школьными заданиями."
-    ),
-}
+def chat_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Следующий",
+                    callback_data="next",
+                ),
+                InlineKeyboardButton(
+                    text="⏹ Завершить",
+                    callback_data="stop_chat",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🚩 Пожаловаться",
+                    callback_data="report",
+                )
+            ],
+        ]
+    )
 
 
-# =========================================================
-# SIMPLE AI WITHOUT EXTERNAL API
-# =========================================================
-
-def local_ai(question: str) -> str:
-
-    q = question.lower().strip()
-
-    if not q:
-        return "Напиши вопрос."
-
-    if "привет" in q:
-        return (
-            "👋 Привет!\n\n"
-            "Я учебный помощник. "
-            "Можешь отправить мне задачу по математике, "
-            "физике, химии, истории или языкам."
-        )
-
-    if "кто ты" in q:
-        return (
-            "🤖 Я учебный бот.\n\n"
-            "Моя задача — помочь тебе разобраться "
-            "с учебным материалом и объяснить решение."
-        )
-
-    if "формула" in q and "скорост" in q:
-        return (
-            "⚡ Формула скорости:\n\n"
-            "<code>v = s / t</code>\n\n"
-            "где:\n"
-            "v — скорость\n"
-            "s — путь\n"
-            "t — время"
-        )
-
-    if "площадь" in q and "круг" in q:
-        return (
-            "⭕ Площадь круга:\n\n"
-            "<code>S = πr²</code>\n\n"
-            "где r — радиус."
-        )
-
-    if "процент" in q:
-        return (
-            "📊 Чтобы найти процент от числа:\n\n"
-            "<code>число × процент / 100</code>\n\n"
-            "Например:\n"
-            "20% от 500 = 500 × 20 / 100 = 100."
-        )
-
-    return (
-        "🧠 <b>Разберём задачу</b>\n\n"
-        f"<b>Твой вопрос:</b>\n{escape(question)}\n\n"
-        "Сейчас я работаю в базовом режиме.\n\n"
-        "Чтобы получить полноценное ИИ-объяснение, "
-        "можно подключить AI_API_KEY в Railway.\n\n"
-        "А пока я могу помочь через разделы "
-        "«Предметы», «Тренировка» и «Калькулятор»."
+def after_chat_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔎 Найти нового",
+                    callback_data="find",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏠 Главное меню",
+                    callback_data="home",
+                )
+            ],
+        ]
     )
 
 
 # =========================================================
-# MATH CALCULATOR
+# TEXTS
 # =========================================================
 
-def safe_calculate(expression: str):
+WELCOME_TEXT = """
+👋 <b>Добро пожаловать в анонимную чат-рулетку.</b>
 
-    expression = expression.replace(",", ".")
+Здесь ты можешь случайно найти человека и общаться с ним через бота.
 
-    allowed = "0123456789+-*/(). "
+🔐 Твой Telegram-профиль не показывается собеседнику.
 
-    if any(char not in allowed for char in expression):
-        return None
+💬 Можно отправлять:
+• текст
+• фото
+• видео
+• голосовые
+• документы
+• стикеры
+• GIF
+• контакты
+• геолокацию
 
+Используй кнопки ниже.
+"""
+
+HELP_TEXT = """
+ℹ️ <b>Как работает чат-рулетка</b>
+
+1. Нажми «🔎 Найти собеседника».
+2. Бот найдёт случайного человека.
+3. После соединения отправляй сообщения как обычно.
+4. Собеседник получит их от бота.
+5. Нажми «🔄 Следующий», чтобы сменить человека.
+6. Нажми «⏹ Завершить», чтобы закончить разговор.
+
+🔐 Мы не показываем собеседнику твой username или профиль.
+
+🚩 Если собеседник нарушает правила, используй кнопку «Пожаловаться».
+
+⚠️ Не отправляй незнакомым людям пароли,
+коды подтверждения, банковские данные или личные документы.
+"""
+
+
+# =========================================================
+# UTILITIES
+# =========================================================
+
+async def safe_send(user_id: int, text: str, **kwargs):
     try:
-        result = eval(
-            expression,
-            {
-                "__builtins__": {}
-            },
-            {},
+        return await bot.send_message(
+            user_id,
+            text,
+            **kwargs,
         )
-
-        if isinstance(result, (int, float)):
-            return result
-
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "Не удалось отправить сообщение %s: %s",
+            user_id,
+            e,
+        )
         return None
 
-    return None
+
+async def notify_partner_chat_ended(partner_id: int):
+    await safe_send(
+        partner_id,
+        """
+⏹ <b>Собеседник завершил разговор.</b>
+
+Можешь найти нового человека.
+""",
+        reply_markup=after_chat_keyboard(),
+    )
 
 
-# =========================================================
-# TRAINING
-# =========================================================
+async def find_partner(user_id: int):
+    async with state_lock:
 
-TRAINING = {}
+        cleanup_queue()
 
+        # Если уже есть собеседник
+        existing = get_partner(user_id)
 
-def generate_question():
+        if existing:
+            return existing
 
-    a = random.randint(2, 20)
-    b = random.randint(2, 20)
+        # Удаляем самого себя из очереди перед поиском
+        remove_from_queue(user_id)
 
-    answer = a + b
+        users = get_queue_users()
 
-    return (
-        f"🧠 <b>Тренировка</b>\n\n"
-        f"Сколько будет:\n\n"
-        f"<b>{a} + {b}</b> ?"
-    ), answer
+        for candidate in users:
 
+            if candidate == user_id:
+                continue
 
-# =========================================================
-# DAILY
-# =========================================================
+            if is_banned(candidate):
+                remove_from_queue(candidate)
+                continue
 
-DAILY_TASKS = [
-    (
-        "🧮 <b>Задание дня</b>\n\n"
-        "Если 20% от числа равны 40, "
-        "чему равно число?"
-    ),
-    (
-        "⚛️ <b>Задание дня</b>\n\n"
-        "Как называется сила, с которой "
-        "тело притягивается к Земле?"
-    ),
-    (
-        "📖 <b>Задание дня</b>\n\n"
-        "Что такое историческое событие?"
-    ),
-    (
-        "🇬🇧 <b>Задание дня</b>\n\n"
-        "Переведи слово <b>school</b>."
-    ),
-]
+            if are_blocked(user_id, candidate):
+                continue
+
+            if are_blocked(candidate, user_id):
+                continue
+
+            add_pair(user_id, candidate)
+
+            return candidate
+
+        add_to_queue(user_id)
+
+        return None
 
 
-# =========================================================
-# BOT
-# =========================================================
+async def end_chat(user_id: int, notify=True):
+    async with state_lock:
 
-dp = Dispatcher()
+        partner = get_partner(user_id)
+
+        remove_pair(user_id)
+        remove_from_queue(user_id)
+
+    if partner and notify:
+        await notify_partner_chat_ended(partner)
+
+    return partner
+
+
+async def next_chat(user_id: int):
+    partner = await end_chat(user_id, notify=True)
+
+    await safe_send(
+        user_id,
+        "🔄 Ищем нового собеседника...",
+    )
+
+    return await find_partner(user_id)
+
+
+async def connect_message(user_id: int, partner_id: int):
+    await safe_send(
+        user_id,
+        """
+🎉 <b>Собеседник найден!</b>
+
+Теперь можете общаться.
+
+Твои сообщения будут передаваться через бота.
+
+🔐 Не отправляй личные данные незнакомцам.
+""",
+        reply_markup=chat_keyboard(),
+    )
+
+    await safe_send(
+        partner_id,
+        """
+🎉 <b>Собеседник найден!</b>
+
+Теперь можете общаться.
+
+Твои сообщения будут передаваться через бота.
+
+🔐 Не отправляй личные данные незнакомцам.
+""",
+        reply_markup=chat_keyboard(),
+    )
 
 
 # =========================================================
@@ -677,29 +649,36 @@ dp = Dispatcher()
 # =========================================================
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def start_handler(message: Message):
 
-    create_user(
-        message.from_user.id,
-        message.from_user.full_name,
-    )
+    if message.chat.type != ChatType.PRIVATE:
+        return
 
-    update_streak(message.from_user.id)
-    add_xp(message.from_user.id, 5)
+    user_id = message.from_user.id
+
+    ensure_user(user_id)
+
+    if is_banned(user_id):
+        await message.answer(
+            "🚫 Твой доступ к боту ограничен."
+        )
+        return
+
+    partner = get_partner(user_id)
+
+    if partner:
+        await message.answer(
+            """
+💬 <b>Ты уже находишься в чате.</b>
+
+Просто отправь сообщение.
+""",
+            reply_markup=chat_keyboard(),
+        )
+        return
 
     await message.answer(
-        "🚀 <b>STUDY AI</b>\n\n"
-        f"Привет, <b>{escape(message.from_user.first_name)}</b>!\n\n"
-        "Я твой учебный помощник.\n\n"
-        "📚 Решение задач\n"
-        "🧠 Объяснение тем\n"
-        "🎯 Тренировки\n"
-        "📊 Статистика\n"
-        "🏆 Уровни и XP\n"
-        "📖 История запросов\n"
-        "⭐ Избранное\n"
-        "🧮 Калькулятор\n\n"
-        "Выбирай действие:",
+        WELCOME_TEXT,
         reply_markup=main_keyboard(),
     )
 
@@ -708,514 +687,494 @@ async def start(message: Message):
 # HELP
 # =========================================================
 
+@dp.callback_query(F.data == "help")
+async def help_callback(callback: CallbackQuery):
+
+    await callback.answer()
+
+    await callback.message.edit_text(
+        HELP_TEXT,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="🔎 Найти собеседника",
+                        callback_data="find",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data="home",
+                    )
+                ],
+            ]
+        ),
+    )
+
+
 @dp.message(Command("help"))
 async def help_command(message: Message):
 
-    await message.answer(
-        "ℹ️ <b>Помощь</b>\n\n"
-        "/start — главное меню\n"
-        "/help — помощь\n"
-        "/stats — статистика\n"
-        "/history — история\n"
-        "/daily — задание дня\n\n"
-        "Также можешь просто написать мне вопрос."
-    )
-
-
-# =========================================================
-# STATS COMMAND
-# =========================================================
-
-@dp.message(Command("stats"))
-async def stats_command(message: Message):
-
-    user = get_user(message.from_user.id)
-
-    if not user:
-        create_user(
-            message.from_user.id,
-            message.from_user.full_name,
-        )
-        user = get_user(message.from_user.id)
-
-    _, name, xp, level, questions, correct, streak, _ = user
-
-    accuracy = 0
-
-    if questions:
-        accuracy = int(correct / questions * 100)
+    ensure_user(message.from_user.id)
 
     await message.answer(
-        "📊 <b>Твоя статистика</b>\n\n"
-        f"👤 {escape(name)}\n"
-        f"⭐ XP: <b>{xp}</b>\n"
-        f"🏆 Уровень: <b>{level}</b>\n"
-        f"📚 Запросов: <b>{questions}</b>\n"
-        f"✅ Правильных: <b>{correct}</b>\n"
-        f"🎯 Точность: <b>{accuracy}%</b>\n"
-        f"🔥 Серия дней: <b>{streak}</b>",
-        reply_markup=back_keyboard(),
+        HELP_TEXT,
+        reply_markup=main_keyboard(),
     )
 
 
 # =========================================================
-# HISTORY COMMAND
-# =========================================================
-
-@dp.message(Command("history"))
-async def history_command(message: Message):
-
-    rows = get_history(
-        message.from_user.id,
-        10,
-    )
-
-    if not rows:
-        await message.answer(
-            "📖 История пока пустая.",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    text = "📖 <b>Последние запросы</b>\n\n"
-
-    for i, row in enumerate(rows, 1):
-
-        subject, question, created = row
-
-        short = question[:100]
-
-        text += (
-            f"<b>{i}.</b> "
-            f"{escape(subject)}\n"
-            f"{escape(short)}\n\n"
-        )
-
-    await message.answer(
-        text,
-        reply_markup=back_keyboard(),
-    )
-
-
-# =========================================================
-# DAILY COMMAND
-# =========================================================
-
-@dp.message(Command("daily"))
-async def daily_command(message: Message):
-
-    task = DAILY_TASKS[
-        datetime.now().day % len(DAILY_TASKS)
-    ]
-
-    await message.answer(
-        task,
-        reply_markup=back_keyboard(),
-    )
-
-
-# =========================================================
-# CALLBACKS
+# HOME
 # =========================================================
 
 @dp.callback_query(F.data == "home")
-async def callback_home(callback: CallbackQuery):
+async def home_callback(callback: CallbackQuery):
+
+    await callback.answer()
 
     await callback.message.edit_text(
-        "🏠 <b>Главное меню</b>\n\n"
-        "Выбирай нужный раздел:",
+        WELCOME_TEXT,
         reply_markup=main_keyboard(),
     )
 
-    await callback.answer()
 
+# =========================================================
+# FIND
+# =========================================================
 
-@dp.callback_query(F.data == "subjects")
-async def callback_subjects(callback: CallbackQuery):
+@dp.callback_query(F.data == "find")
+async def find_callback(callback: CallbackQuery):
 
-    await callback.message.edit_text(
-        "📚 <b>Предметы</b>\n\n"
-        "Выбери предмет:",
-        reply_markup=subjects_keyboard(),
-    )
+    user_id = callback.from_user.id
 
-    await callback.answer()
-
-
-@dp.callback_query(F.data.in_(SUBJECTS.keys()))
-async def callback_subject(callback: CallbackQuery):
-
-    subject = callback.data
-
-    await callback.message.edit_text(
-        SUBJECTS[subject],
-        reply_markup=back_keyboard(),
-    )
+    ensure_user(user_id)
 
     await callback.answer()
 
-
-@dp.callback_query(F.data == "stats")
-async def callback_stats(callback: CallbackQuery):
-
-    user = get_user(callback.from_user.id)
-
-    if not user:
-        create_user(
-            callback.from_user.id,
-            callback.from_user.full_name,
+    if is_banned(user_id):
+        await callback.message.answer(
+            "🚫 Твой доступ к боту ограничен."
         )
-        user = get_user(callback.from_user.id)
-
-    _, name, xp, level, questions, correct, streak, _ = user
-
-    accuracy = 0
-
-    if questions:
-        accuracy = int(correct / questions * 100)
-
-    await callback.message.edit_text(
-        "📊 <b>Статистика</b>\n\n"
-        f"👤 {escape(name)}\n"
-        f"⭐ XP: {xp}\n"
-        f"🏆 Уровень: {level}\n"
-        f"📚 Запросов: {questions}\n"
-        f"✅ Правильных: {correct}\n"
-        f"🎯 Точность: {accuracy}%\n"
-        f"🔥 Серия: {streak} дней",
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "history")
-async def callback_history(callback: CallbackQuery):
-
-    rows = get_history(
-        callback.from_user.id,
-        10,
-    )
-
-    if not rows:
-
-        await callback.message.edit_text(
-            "📖 <b>История</b>\n\n"
-            "Пока здесь ничего нет.",
-            reply_markup=back_keyboard(),
-        )
-
-        await callback.answer()
         return
 
-    text = "📖 <b>История запросов</b>\n\n"
+    existing = get_partner(user_id)
 
-    for i, row in enumerate(rows, 1):
+    if existing:
+        await callback.message.answer(
+            """
+💬 Ты уже находишься в разговоре.
 
-        subject, question, created = row
+Отправляй сообщения собеседнику.
+""",
+            reply_markup=chat_keyboard(),
+        )
+        return
 
-        text += (
-            f"<b>{i}.</b> "
-            f"{escape(subject)}\n"
-            f"{escape(question[:100])}\n\n"
+    partner = await find_partner(user_id)
+
+    if partner:
+
+        await connect_message(
+            user_id,
+            partner,
         )
 
-    await callback.message.edit_text(
-        text,
-        reply_markup=back_keyboard(),
-    )
+    else:
+
+        await callback.message.edit_text(
+            """
+🔎 <b>Ищем собеседника...</b>
+
+Ты добавлен в очередь.
+
+Как только найдём человека,
+бот автоматически соединит вас.
+""",
+            reply_markup=searching_keyboard(),
+        )
+
+
+# =========================================================
+# STOP SEARCH
+# =========================================================
+
+@dp.callback_query(F.data == "stop_search")
+async def stop_search_callback(callback: CallbackQuery):
+
+    user_id = callback.from_user.id
 
     await callback.answer()
 
+    async with state_lock:
+        remove_from_queue(user_id)
 
-@dp.callback_query(F.data == "favorites")
-async def callback_favorites(callback: CallbackQuery):
-
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute(
+    await callback.message.edit_text(
         """
-        SELECT question, answer
-        FROM favorites
-        WHERE user_id = ?
-        ORDER BY id DESC
-        LIMIT 5
-        """,
-        (callback.from_user.id,),
+⏹ <b>Поиск остановлен.</b>
+
+Когда захочешь попробовать снова,
+нажми кнопку ниже.
+""",
+        reply_markup=after_chat_keyboard(),
     )
 
-    rows = cur.fetchall()
 
-    conn.close()
+# =========================================================
+# STOP CHAT
+# =========================================================
 
-    if not rows:
+@dp.callback_query(F.data == "stop_chat")
+async def stop_chat_callback(callback: CallbackQuery):
+
+    user_id = callback.from_user.id
+
+    await callback.answer()
+
+    partner = await end_chat(
+        user_id,
+        notify=True,
+    )
+
+    if partner:
+        await callback.message.edit_text(
+            """
+⏹ <b>Разговор завершён.</b>
+
+Собеседник получил уведомление.
+""",
+            reply_markup=after_chat_keyboard(),
+        )
+    else:
+        await callback.message.edit_text(
+            """
+⏹ <b>Чат завершён.</b>
+""",
+            reply_markup=after_chat_keyboard(),
+        )
+
+
+# =========================================================
+# NEXT
+# =========================================================
+
+@dp.callback_query(F.data == "next")
+async def next_callback(callback: CallbackQuery):
+
+    user_id = callback.from_user.id
+
+    await callback.answer(
+        "Ищем нового собеседника..."
+    )
+
+    partner = await next_chat(user_id)
+
+    if partner:
+
+        await connect_message(
+            user_id,
+            partner,
+        )
+
+    else:
 
         await callback.message.edit_text(
-            "⭐ <b>Избранное</b>\n\n"
-            "Здесь пока ничего нет.",
-            reply_markup=back_keyboard(),
+            """
+🔎 <b>Ищем нового собеседника...</b>
+
+Ты в очереди.
+Как только найдём человека —
+соединим вас.
+""",
+            reply_markup=searching_keyboard(),
         )
-
-        await callback.answer()
-        return
-
-    text = "⭐ <b>Избранное</b>\n\n"
-
-    for i, (question, answer) in enumerate(rows, 1):
-
-        text += (
-            f"<b>{i}.</b> "
-            f"{escape(question[:100])}\n\n"
-        )
-
-    await callback.message.edit_text(
-        text,
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "calculator")
-async def callback_calculator(callback: CallbackQuery):
-
-    await callback.message.edit_text(
-        "🧮 <b>Калькулятор</b>\n\n"
-        "Напиши пример обычным сообщением.\n\n"
-        "Например:\n"
-        "<code>125 * 4 + 20</code>\n\n"
-        "Поддерживаются:\n"
-        "+  −  ×  ÷  ( )",
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "training")
-async def callback_training(callback: CallbackQuery):
-
-    question, answer = generate_question()
-
-    TRAINING[callback.from_user.id] = answer
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Ответить",
-                    callback_data="answer_training",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔄 Другое",
-                    callback_data="training",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="home",
-                )
-            ],
-        ]
-    )
-
-    await callback.message.edit_text(
-        question,
-        reply_markup=keyboard,
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "answer_training")
-async def callback_answer_training(
-    callback: CallbackQuery,
-):
-
-    answer = TRAINING.get(
-        callback.from_user.id
-    )
-
-    if answer is None:
-
-        await callback.answer(
-            "Сначала получи задание.",
-            show_alert=True,
-        )
-
-        return
-
-    await callback.message.edit_text(
-        "✏️ <b>Напиши свой ответ числом.</b>",
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "daily")
-async def callback_daily(callback: CallbackQuery):
-
-    task = DAILY_TASKS[
-        datetime.now().day % len(DAILY_TASKS)
-    ]
-
-    await callback.message.edit_text(
-        task,
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "ai")
-async def callback_ai(callback: CallbackQuery):
-
-    await callback.message.edit_text(
-        "🤖 <b>ИИ-помощник</b>\n\n"
-        "Просто отправь мне сообщение.\n\n"
-        "Например:\n"
-        "• Реши 2x + 5 = 17\n"
-        "• Объясни закон Ома\n"
-        "• Что такое фотосинтез?\n"
-        "• Переведи текст\n"
-        "• Помоги написать сочинение",
-        reply_markup=back_keyboard(),
-    )
-
-    await callback.answer()
 
 
 # =========================================================
-# TEXT HANDLER
+# REPORT
 # =========================================================
 
-@dp.message(F.text)
-async def text_handler(message: Message):
+@dp.callback_query(F.data == "report")
+async def report_callback(callback: CallbackQuery):
 
-    user_id = message.from_user.id
-    text = message.text.strip()
+    user_id = callback.from_user.id
 
-    create_user(
-        user_id,
-        message.from_user.full_name,
+    partner = get_partner(user_id)
+
+    await callback.answer(
+        "Жалоба отправлена.",
+        show_alert=True,
     )
 
-    update_streak(user_id)
+    if not partner:
+        return
 
-    # -----------------------------------------------------
-    # TRAINING ANSWER
-    # -----------------------------------------------------
+    add_report(
+        reporter=user_id,
+        reported=partner,
+    )
 
-    if user_id in TRAINING:
+    if ADMIN_ID:
 
-        expected = TRAINING[user_id]
+        await safe_send(
+            ADMIN_ID,
+            f"""
+🚩 <b>Новая жалоба</b>
 
-        try:
-            user_answer = float(
-                text.replace(",", ".")
-            )
+Reporter ID:
+<code>{user_id}</code>
 
-            if user_answer == expected:
+Reported ID:
+<code>{partner}</code>
 
-                register_question(user_id)
-                register_correct(user_id)
-                add_xp(user_id, 20)
+Используй:
+<code>/ban {partner}</code>
+если нужно ограничить пользователя.
+""",
+        )
 
-                del TRAINING[user_id]
-
-                await message.answer(
-                    "🎉 <b>Правильно!</b>\n\n"
-                    "Ты получил <b>+20 XP</b> ⭐",
-                    reply_markup=main_keyboard(),
-                )
-
-                return
-
-            else:
-
-                register_question(user_id)
-                add_xp(user_id, 5)
-
-                del TRAINING[user_id]
-
-                await message.answer(
-                    f"❌ Неправильно.\n\n"
-                    f"Правильный ответ: "
-                    f"<b>{expected}</b>\n\n"
-                    "Ты получил +5 XP за попытку.",
-                    reply_markup=main_keyboard(),
-                )
-
-                return
-
-        except ValueError:
-            pass
-
-    # -----------------------------------------------------
-    # CALCULATOR
-    # -----------------------------------------------------
-
-    if any(
-        symbol in text
-        for symbol in ["+", "-", "*", "/"]
-    ):
-
-        result = safe_calculate(text)
-
-        if result is not None:
-
-            register_question(user_id)
-            add_xp(user_id, 5)
-
-            await message.answer(
-                "🧮 <b>Ответ:</b>\n\n"
-                f"<code>{escape(text)}</code>"
-                f" = <b>{result}</b>\n\n"
-                "+5 XP ⭐",
-                reply_markup=main_keyboard(),
-            )
-
-            return
-
-    # -----------------------------------------------------
-    # AI / GENERAL
-    # -----------------------------------------------------
-
-    register_question(user_id)
-    add_xp(user_id, 5)
-
-    answer = local_ai(text)
-
-    save_history(
+    # После жалобы автоматически разрываем чат
+    await end_chat(
         user_id,
-        "AI",
-        text,
-        answer,
+        notify=True,
+    )
+
+    await safe_send(
+        user_id,
+        """
+🚩 <b>Жалоба принята.</b>
+
+Разговор завершён.
+
+Если хочешь, можешь найти нового собеседника.
+""",
+        reply_markup=after_chat_keyboard(),
+    )
+
+
+# =========================================================
+# ADMIN
+# =========================================================
+
+def admin_only(user_id: int) -> bool:
+    return ADMIN_ID is not None and user_id == ADMIN_ID
+
+
+@dp.message(Command("stats"))
+async def stats_handler(message: Message):
+
+    if not admin_only(message.from_user.id):
+        return
+
+    users, queue, pairs, reports, messages = get_stats()
+
+    await message.answer(
+        f"""
+📊 <b>Статистика бота</b>
+
+👤 Пользователей: <b>{users}</b>
+🔎 В очереди: <b>{queue}</b>
+💬 Активных пар: <b>{pairs}</b>
+🚩 Жалоб: <b>{reports}</b>
+💌 Сообщений: <b>{messages}</b>
+"""
+    )
+
+
+@dp.message(Command("ban"))
+async def ban_handler(message: Message):
+
+    if not admin_only(message.from_user.id):
+        return
+
+    args = message.text.split()
+
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer(
+            "Использование: /ban USER_ID"
+        )
+        return
+
+    target = int(args[1])
+
+    ensure_user(target)
+
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE users
+            SET banned = 1
+            WHERE user_id = ?
+            """,
+            (target,),
+        )
+
+        conn.commit()
+
+    await end_chat(
+        target,
+        notify=True,
     )
 
     await message.answer(
-        answer,
-        reply_markup=main_keyboard(),
+        f"🔨 Пользователь <code>{target}</code> заблокирован."
+    )
+
+    await safe_send(
+        target,
+        """
+🚫 <b>Доступ ограничен.</b>
+
+Ты больше не можешь использовать этот бот.
+""",
+    )
+
+
+@dp.message(Command("unban"))
+async def unban_handler(message: Message):
+
+    if not admin_only(message.from_user.id):
+        return
+
+    args = message.text.split()
+
+    if len(args) != 2 or not args[1].isdigit():
+        await message.answer(
+            "Использование: /unban USER_ID"
+        )
+        return
+
+    target = int(args[1])
+
+    ensure_user(target)
+
+    with closing(db()) as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE users
+            SET banned = 0
+            WHERE user_id = ?
+            """,
+            (target,),
+        )
+
+        conn.commit()
+
+    await message.answer(
+        f"✅ Пользователь <code>{target}</code> разблокирован."
+    )
+
+
+@dp.message(Command("id"))
+async def id_handler(message: Message):
+
+    await message.answer(
+        f"🆔 Твой ID:\n<code>{message.from_user.id}</code>"
     )
 
 
 # =========================================================
-# UNKNOWN CONTENT
+# MESSAGE RELAY
 # =========================================================
 
 @dp.message()
-async def unknown_message(message: Message):
+async def relay_message(message: Message):
 
-    await message.answer(
-        "🤔 Я пока умею работать с текстовыми сообщениями.\n\n"
-        "Напиши задачу или используй меню.",
-        reply_markup=main_keyboard(),
-    )
+    # Работаем только в личке
+    if message.chat.type != ChatType.PRIVATE:
+        return
+
+    user_id = message.from_user.id
+
+    ensure_user(user_id)
+
+    if is_banned(user_id):
+        await message.answer(
+            "🚫 Доступ к боту ограничен."
+        )
+        return
+
+    # Не пересылаем команды
+    if message.text and message.text.startswith("/"):
+        return
+
+    partner = get_partner(user_id)
+
+    if not partner:
+        await message.answer(
+            """
+🔎 <b>Ты сейчас не в чате.</b>
+
+Нажми «Найти собеседника», чтобы начать.
+""",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    # Антиспам
+    now = time.monotonic()
+
+    previous = last_message_time.get(user_id, 0)
+
+    if now - previous < MESSAGE_COOLDOWN:
+        return
+
+    last_message_time[user_id] = now
+
+    # Проверяем, не заблокировали ли пользователи друг друга
+    if are_blocked(user_id, partner):
+        await end_chat(
+            user_id,
+            notify=False,
+        )
+
+        await message.answer(
+            """
+🚫 Этот чат больше недоступен.
+
+Найди нового собеседника.
+""",
+            reply_markup=after_chat_keyboard(),
+        )
+
+        return
+
+    # Передача сообщения через Telegram copyMessage.
+    # В отличие от forwardMessage, копия не содержит
+    # ссылку на исходное сообщение/автора.
+    try:
+
+        await bot.copy_message(
+            chat_id=partner,
+            from_chat_id=user_id,
+            message_id=message.message_id,
+        )
+
+        add_message_stats(
+            sender=user_id,
+            receiver=partner,
+        )
+
+    except Exception as e:
+
+        logger.warning(
+            "Ошибка передачи сообщения %s -> %s: %s",
+            user_id,
+            partner,
+            e,
+        )
+
+        await message.answer(
+            """
+⚠️ Не удалось передать это сообщение.
+
+Попробуй отправить его ещё раз или используй обычный текст.
+"""
+        )
 
 
 # =========================================================
@@ -1223,41 +1182,73 @@ async def unknown_message(message: Message):
 # =========================================================
 
 @dp.errors()
-async def global_error_handler(event):
+async def errors_handler(event):
 
     logger.exception(
-        "Unhandled error: %s",
+        "Ошибка обработчика: %s",
         event.exception,
     )
 
-    try:
-        if event.update.message:
-            await event.update.message.answer(
-                "⚠️ Произошла внутренняя ошибка.\n"
-                "Попробуй ещё раз."
-            )
-    except Exception:
-        pass
 
-    return True
+# =========================================================
+# CLEANUP LOOP
+# =========================================================
+
+async def background_cleanup():
+
+    while True:
+
+        try:
+            cleanup_queue()
+
+            # Чистим старые cooldown-записи
+            now = time.monotonic()
+
+            expired = [
+                user_id
+                for user_id, timestamp
+                in last_message_time.items()
+                if now - timestamp > 300
+            ]
+
+            for user_id in expired:
+                last_message_time.pop(
+                    user_id,
+                    None,
+                )
+
+        except Exception as e:
+
+            logger.exception(
+                "Ошибка фоновой очистки: %s",
+                e,
+            )
+
+        await asyncio.sleep(60)
 
 
 # =========================================================
-# START BOT
+# MAIN
 # =========================================================
 
 async def main():
 
     init_db()
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.HTML,
-        ),
+    logger.info("===================================")
+    logger.info("ANONYMOUS CHAT ROULETTE STARTING")
+    logger.info("===================================")
+
+    me = await bot.get_me()
+
+    logger.info(
+        "Bot started: @%s",
+        me.username,
     )
 
-    logger.info("Starting STUDY AI...")
+    cleanup_task = asyncio.create_task(
+        background_cleanup()
+    )
 
     try:
 
@@ -1272,17 +1263,13 @@ async def main():
 
     finally:
 
+        cleanup_task.cancel()
+
         await bot.session.close()
 
 
 if __name__ == "__main__":
-
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
-
-        logger.info(
-            "Bot stopped by user."
-        )
-        
+        logger.info("Bot stopped.")
