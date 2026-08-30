@@ -5,10 +5,10 @@ import random
 import sqlite3
 import time
 from contextlib import closing
-from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatType
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     Message,
@@ -34,14 +34,20 @@ PREMIUM_STARS = 59
 PREMIUM_DAYS = 30
 
 if not TOKEN:
-    raise RuntimeError("Не найден BOT_TOKEN")
+    raise RuntimeError("BOT_TOKEN не найден")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-bot = Bot(TOKEN)
+bot = Bot(
+    TOKEN,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML
+    )
+)
+
 dp = Dispatcher()
 
 
@@ -49,14 +55,14 @@ dp = Dispatcher()
 # DATABASE
 # =========================================================
 
-def connect():
+def db():
     return sqlite3.connect(DB, timeout=30)
 
 
 def init_db():
-    with closing(connect()) as db:
+    with closing(db()) as con:
 
-        db.execute("""
+        con.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
@@ -76,17 +82,15 @@ def init_db():
         )
         """)
 
-        db.execute("""
+        con.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY,
             title TEXT DEFAULT '',
-            xp INTEGER DEFAULT 0,
-            level INTEGER DEFAULT 1,
             created INTEGER DEFAULT 0
         )
         """)
 
-        db.execute("""
+        con.execute("""
         CREATE TABLE IF NOT EXISTS group_users (
             group_id INTEGER,
             user_id INTEGER,
@@ -97,15 +101,7 @@ def init_db():
         )
         """)
 
-        db.execute("""
-        CREATE TABLE IF NOT EXISTS referrals (
-            user_id INTEGER PRIMARY KEY,
-            inviter INTEGER,
-            created INTEGER
-        )
-        """)
-
-        db.execute("""
+        con.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -116,16 +112,7 @@ def init_db():
         )
         """)
 
-        db.execute("""
-        CREATE TABLE IF NOT EXISTS achievements (
-            user_id INTEGER,
-            achievement TEXT,
-            created INTEGER,
-            UNIQUE(user_id, achievement)
-        )
-        """)
-
-        db.commit()
+        con.commit()
 
 
 # =========================================================
@@ -133,10 +120,8 @@ def init_db():
 # =========================================================
 
 def ensure_user(user):
-    now = int(time.time())
-
-    with closing(connect()) as db:
-        db.execute("""
+    with closing(db()) as con:
+        con.execute("""
         INSERT INTO users
         (id, username, name, created)
         VALUES (?, ?, ?, ?)
@@ -149,59 +134,35 @@ def ensure_user(user):
             user.id,
             user.username or "",
             user.first_name or "Игрок",
-            now
+            int(time.time())
         ))
 
-        db.commit()
+        con.commit()
 
 
 def get_user(user_id):
-    with closing(connect()) as db:
-        return db.execute("""
-        SELECT
-            id,
-            username,
-            name,
-            coins,
-            xp,
-            level,
-            games,
-            wins,
-            losses,
-            streak,
-            last_daily,
-            premium_until,
-            referrals,
-            banned
+    with closing(db()) as con:
+        return con.execute("""
+        SELECT *
         FROM users
         WHERE id=?
         """, (user_id,)).fetchone()
 
 
 def add_coins(user_id, amount):
-    with closing(connect()) as db:
-        db.execute("""
+    with closing(db()) as con:
+        con.execute("""
         UPDATE users
         SET coins = coins + ?
         WHERE id=?
         """, (amount, user_id))
-        db.commit()
-
-
-def remove_coins(user_id, amount):
-    with closing(connect()) as db:
-        db.execute("""
-        UPDATE users
-        SET coins = MAX(0, coins - ?)
-        WHERE id=?
-        """, (amount, user_id))
-        db.commit()
+        con.commit()
 
 
 def add_xp(user_id, amount):
-    with closing(connect()) as db:
+    with closing(db()) as con:
 
-        row = db.execute("""
+        row = con.execute("""
         SELECT xp, level
         FROM users
         WHERE id=?
@@ -217,74 +178,30 @@ def add_xp(user_id, amount):
             xp -= level * 100
             level += 1
 
-        db.execute("""
+        con.execute("""
         UPDATE users
         SET xp=?, level=?
         WHERE id=?
-        """, (
-            xp,
-            level,
-            user_id
-        ))
+        """, (xp, level, user_id))
 
-        db.commit()
+        con.commit()
 
 
-def is_premium(user_id):
+def premium(user_id):
     row = get_user(user_id)
 
     return bool(
-        row and
-        row[11] > int(time.time())
+        row and row[11] > int(time.time())
     )
 
 
-def premium_until(user_id):
-    row = get_user(user_id)
+def game_result(user_id, win=False, reward=0):
 
-    if not row:
-        return 0
-
-    return row[11]
-
-
-def activate_premium(user_id, days):
-    now = int(time.time())
-
-    current = premium_until(user_id)
-
-    start = max(
-        now,
-        current
-    )
-
-    until = start + days * 86400
-
-    with closing(connect()) as db:
-        db.execute("""
-        UPDATE users
-        SET premium_until=?
-        WHERE id=?
-        """, (
-            until,
-            user_id
-        ))
-
-        db.commit()
-
-    return until
-
-
-def game_result(
-    user_id,
-    win=False,
-    reward=0
-):
-    if is_premium(user_id):
+    if premium(user_id):
         reward = int(reward * 1.5)
 
-    with closing(connect()) as db:
-        db.execute("""
+    with closing(db()) as con:
+        con.execute("""
         UPDATE users
         SET
             games=games+1,
@@ -299,96 +216,12 @@ def game_result(
             user_id
         ))
 
-        db.commit()
+        con.commit()
 
     add_xp(
         user_id,
         25 if win else 10
     )
-
-    check_achievements(user_id)
-
-
-# =========================================================
-# ACHIEVEMENTS
-# =========================================================
-
-def achievement(user_id, name):
-    with closing(connect()) as db:
-
-        exists = db.execute("""
-        SELECT 1
-        FROM achievements
-        WHERE user_id=? AND achievement=?
-        """, (
-            user_id,
-            name
-        )).fetchone()
-
-        if exists:
-            return False
-
-        db.execute("""
-        INSERT INTO achievements
-        (user_id, achievement, created)
-        VALUES (?, ?, ?)
-        """, (
-            user_id,
-            name,
-            int(time.time())
-        ))
-
-        db.commit()
-
-    add_coins(
-        user_id,
-        250
-    )
-
-    return True
-
-
-def check_achievements(user_id):
-
-    row = get_user(user_id)
-
-    if not row:
-        return
-
-    games = row[6]
-    wins = row[7]
-    coins = row[3]
-    level = row[5]
-
-    if games >= 1:
-        achievement(
-            user_id,
-            "Первый матч"
-        )
-
-    if wins >= 10:
-        achievement(
-            user_id,
-            "10 побед"
-        )
-
-    if wins >= 50:
-        achievement(
-            user_id,
-            "50 побед"
-        )
-
-    if coins >= 10000:
-        achievement(
-            user_id,
-            "Богач"
-        )
-
-    if level >= 10:
-        achievement(
-            user_id,
-            "Уровень 10"
-        )
 
 
 # =========================================================
@@ -396,31 +229,29 @@ def check_achievements(user_id):
 # =========================================================
 
 def ensure_group(message):
+
     if message.chat.type not in (
         ChatType.GROUP,
         ChatType.SUPERGROUP
     ):
         return
 
-    now = int(time.time())
+    with closing(db()) as con:
 
-    with closing(connect()) as db:
-
-        db.execute("""
+        con.execute("""
         INSERT INTO groups
         (id, title, created)
         VALUES (?, ?, ?)
 
         ON CONFLICT(id)
-        DO UPDATE SET
-            title=excluded.title
+        DO UPDATE SET title=excluded.title
         """, (
             message.chat.id,
             message.chat.title or "Группа",
-            now
+            int(time.time())
         ))
 
-        db.execute("""
+        con.execute("""
         INSERT OR IGNORE INTO group_users
         (group_id, user_id)
         VALUES (?, ?)
@@ -429,18 +260,33 @@ def ensure_group(message):
             message.from_user.id
         ))
 
-        db.commit()
+        con.commit()
 
 
-def group_game(
-    chat_id,
-    user_id,
-    win=False,
-    reward=0
-):
-    with closing(connect()) as db:
+def group_members(chat_id):
 
-        db.execute("""
+    with closing(db()) as con:
+
+        return con.execute("""
+        SELECT
+            gu.user_id,
+            u.name,
+            u.username,
+            gu.games,
+            gu.wins,
+            gu.coins
+        FROM group_users gu
+        JOIN users u
+        ON u.id=gu.user_id
+        WHERE gu.group_id=?
+        """, (chat_id,)).fetchall()
+
+
+def group_game(chat_id, user_id, win=False, reward=0):
+
+    with closing(db()) as con:
+
+        con.execute("""
         INSERT OR IGNORE INTO group_users
         (group_id, user_id)
         VALUES (?, ?)
@@ -449,7 +295,7 @@ def group_game(
             user_id
         ))
 
-        db.execute("""
+        con.execute("""
         UPDATE group_users
         SET
             games=games+1,
@@ -463,16 +309,7 @@ def group_game(
             user_id
         ))
 
-        db.execute("""
-        UPDATE groups
-        SET xp=xp+?
-        WHERE id=?
-        """, (
-            20,
-            chat_id
-        ))
-
-        db.commit()
+        con.commit()
 
     game_result(
         user_id,
@@ -481,36 +318,16 @@ def group_game(
     )
 
 
-def group_members(chat_id):
-
-    with closing(connect()) as db:
-        return db.execute("""
-        SELECT
-            gu.user_id,
-            u.name,
-            u.username,
-            gu.games,
-            gu.wins,
-            gu.coins
-        FROM group_users gu
-        JOIN users u
-        ON u.id=gu.user_id
-        WHERE gu.group_id=?
-        """, (
-            chat_id
-        )).fetchall()
-
-
 # =========================================================
 # KEYBOARDS
 # =========================================================
 
-def main_menu():
+def home_keyboard():
 
     b = InlineKeyboardBuilder()
 
     b.button(
-        text="🎮 Играть",
+        text="🎮 Игры",
         callback_data="games"
     )
 
@@ -530,18 +347,13 @@ def main_menu():
     )
 
     b.button(
-        text="🎁 Награда",
+        text="🎁 Daily",
         callback_data="daily"
     )
 
     b.button(
-        text="🏅 Достижения",
-        callback_data="achievements"
-    )
-
-    b.button(
-        text="👥 Пригласить",
-        callback_data="referrals"
+        text="🎭 Мафия",
+        callback_data="mafia_info"
     )
 
     b.button(
@@ -554,53 +366,12 @@ def main_menu():
         callback_data="add_group"
     )
 
-    b.button(
-        text="ℹ️ Помощь",
-        callback_data="help"
-    )
-
-    b.adjust(
-        2, 2, 2, 2, 1, 1
-    )
+    b.adjust(2, 2, 2, 1, 1)
 
     return b.as_markup()
 
 
-def games_menu():
-
-    b = InlineKeyboardBuilder()
-
-    games = [
-        ("🪙 Монетка", "coin"),
-        ("🎲 Кубик", "dice"),
-        ("🎰 Слот", "slot"),
-        ("✊ КНБ", "rps"),
-        ("🔢 Число", "number"),
-        ("⚡ Множитель", "multiplier"),
-        ("🎁 Сундук", "chest"),
-        ("🧠 Викторина", "quiz"),
-        ("💎 Premium Jackpot", "premium_jackpot"),
-    ]
-
-    for text, callback in games:
-        b.button(
-            text=text,
-            callback_data="game_" + callback
-        )
-
-    b.button(
-        text="⬅️ Назад",
-        callback_data="home"
-    )
-
-    b.adjust(
-        2, 2, 2, 2, 1, 1
-    )
-
-    return b.as_markup()
-
-
-def back():
+def back_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -623,137 +394,1121 @@ async def start(
     command: CommandObject
 ):
 
+    ensure_user(message.from_user)
+
     if message.chat.type != ChatType.PRIVATE:
         return
 
-    user = message.from_user
-
-    ensure_user(user)
-
-    row = get_user(user.id)
-
-    if row and row[13]:
-        await message.answer(
-            "🚫 Ты заблокирован."
-        )
-        return
-
-    # REFERRAL
-    if command.args:
-
-        arg = command.args
-
-        if arg.startswith("ref_"):
-
-            raw = arg[4:]
-
-            if raw.isdigit():
-
-                inviter = int(raw)
-
-                if inviter != user.id:
-
-                    with closing(connect()) as db:
-
-                        exists = db.execute("""
-                        SELECT 1
-                        FROM referrals
-                        WHERE user_id=?
-                        """, (
-                            user.id,
-                        )).fetchone()
-
-                        inviter_exists = db.execute("""
-                        SELECT 1
-                        FROM users
-                        WHERE id=?
-                        """, (
-                            inviter,
-                        )).fetchone()
-
-                        if not exists and inviter_exists:
-
-                            db.execute("""
-                            INSERT INTO referrals
-                            (user_id, inviter, created)
-                            VALUES (?, ?, ?)
-                            """, (
-                                user.id,
-                                inviter,
-                                int(time.time())
-                            ))
-
-                            db.execute("""
-                            UPDATE users
-                            SET referrals=referrals+1
-                            WHERE id=?
-                            """, (
-                                inviter,
-                            ))
-
-                            db.commit()
-
-                            add_coins(
-                                inviter,
-                                500
-                            )
-
-                            activate_premium(
-                                inviter,
-                                1
-                            )
-
-                            try:
-                                await bot.send_message(
-                                    inviter,
-                                    "🎉 Новый реферал!\n\n"
-                                    "🪙 +500 монет\n"
-                                    "⭐ +1 день Premium"
-                                )
-                            except Exception:
-                                pass
-
     await message.answer(
         """
-<b>🎲 RANDOM PARTY</b>
+🎲 RANDOM PARTY
 
-Добро пожаловать.
+Социальный бот для Telegram-групп.
 
-Это социальный Telegram-бот, где можно:
+🎮 Игры
+🎭 Мафия
+💰 Экономика
+📈 Уровни
+🏆 Рейтинги
+🎁 Daily
+⭐ Premium
 
-🎮 играть
-💰 зарабатывать
-📈 прокачивать уровень
-🏆 соревноваться
-👥 играть в группах
-🏅 получать достижения
-⭐ использовать Premium
-
-Добавляй меня в группу и устраивайте свою арену.
-
-👇 Выбирай:
+Добавляй меня в группу и играйте вместе.
 """,
-        reply_markup=main_menu()
+        reply_markup=home_keyboard()
     )
 
 
 # =========================================================
-# HOME
+# BOT ADDED TO GROUP
 # =========================================================
 
-@dp.callback_query(F.data == "home")
-async def home(call: CallbackQuery):
+@dp.my_chat_member()
+async def bot_added(event):
+
+    if event.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    old = event.old_chat_member.status
+    new = event.new_chat_member.status
+
+    if new not in ("member", "administrator"):
+        return
+
+    if old in ("member", "administrator"):
+        return
+
+    chat_id = event.chat.id
+    title = event.chat.title or "группа"
+
+    with closing(db()) as con:
+        con.execute("""
+        INSERT OR REPLACE INTO groups
+        (id, title, created)
+        VALUES (?, ?, ?)
+        """, (
+            chat_id,
+            title,
+            int(time.time())
+        ))
+        con.commit()
+
+    me = await bot.get_me()
+
+    add_url = (
+        f"https://t.me/{me.username}"
+        "?startgroup=true"
+    )
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎮 Игры",
+                    callback_data="group_help"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎭 Мафия",
+                    callback_data="group_mafia"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить в другую группу",
+                    url=add_url
+                )
+            ]
+        ]
+    )
+
+    await bot.send_message(
+        chat_id,
+        f"""
+🎉 RANDOM PARTY подключён!
+
+Добро пожаловать в «{title}».
+
+Теперь здесь доступны:
+
+🎮 Игры
+🎭 Мафия
+⚔️ Дуэли
+🎲 Кубик
+🎰 Слоты
+🎯 Случайный игрок
+🏆 Рейтинг группы
+🎉 События
+💰 Экономика
+
+Напиши:
+
+/party
+
+чтобы открыть меню группы.
+
+А чтобы начать Мафию:
+
+/mafia
+""",
+        reply_markup=keyboard
+    )
+
+
+# =========================================================
+# GROUP HELP
+# =========================================================
+
+@dp.callback_query(F.data == "group_help")
+async def group_help(call: CallbackQuery):
 
     await call.answer()
 
-    await call.message.edit_text(
+    await call.message.answer(
         """
-<b>🎲 RANDOM PARTY</b>
+🎮 ИГРЫ В ГРУППЕ
 
-Главное меню 👇
-""",
-        reply_markup=main_menu()
+/dice — кубик
+/coin — монетка
+/slot — слот
+/duel — дуэль
+/random — случайный игрок
+/top — рейтинг
+/event — событие
+
+🎭 Мафия:
+
+/mafia — создать игру
+/join — присоединиться
+/startmafia — начать
+/mafia_status — статус игры
+"""
     )
+
+
+@dp.callback_query(F.data == "group_mafia")
+async def group_mafia_button(
+    call: CallbackQuery
+):
+
+    await call.answer()
+
+    await call.message.answer(
+        """
+🎭 МАФИЯ
+
+Создай игру:
+
+/mafia
+
+После этого игроки пишут:
+
+/join
+
+Когда собралось минимум 5 человек:
+
+/startmafia
+"""
+    )
+
+
+# =========================================================
+# GROUP PARTY
+# =========================================================
+
+@dp.message(Command("party"))
+async def party(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    await message.answer(
+        """
+🎲 RANDOM PARTY
+
+🎮 Игры:
+/games
+
+🎭 Мафия:
+/mafia
+
+⚔️ Дуэль:
+/duel
+
+🎯 Случайный игрок:
+/random
+
+🎲 Кубик:
+/dice
+
+🎰 Слот:
+/slot
+
+🏆 Рейтинг:
+/top
+
+🎉 Событие:
+/event
+"""
+    )
+
+
+# =========================================================
+# BASIC GROUP GAMES
+# =========================================================
+
+@dp.message(Command("dice"))
+async def dice(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    value = random.randint(1, 6)
+    reward = value * 15
+
+    group_game(
+        message.chat.id,
+        message.from_user.id,
+        reward=reward
+    )
+
+    await message.answer(
+        f"""
+🎲 {message.from_user.first_name}
+
+Выпало: {value}
+
+🪙 +{reward}
+"""
+    )
+
+
+@dp.message(Command("coin"))
+async def coin(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    result = random.choice([
+        "🦅 ОРЁЛ",
+        "🪙 РЕШКА"
+    ])
+
+    await message.answer(
+        f"🪙 {result}"
+    )
+
+
+@dp.message(Command("slot"))
+async def slot(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    symbols = [
+        "🍒",
+        "🍋",
+        "🍊",
+        "⭐",
+        "💎",
+        "7️⃣"
+    ]
+
+    a, b, c = [
+        random.choice(symbols)
+        for _ in range(3)
+    ]
+
+    if a == b == c:
+        reward = 1000
+        win = True
+        result = "💎 ДЖЕКПОТ!"
+
+    elif a == b or b == c or a == c:
+        reward = 150
+        win = True
+        result = "🔥 ПАРА!"
+
+    else:
+        reward = 10
+        win = False
+        result = "😈 Не повезло"
+
+    group_game(
+        message.chat.id,
+        message.from_user.id,
+        win,
+        reward
+    )
+
+    await message.answer(
+        f"""
+🎰 {a} {b} {c}
+
+{result}
+
+🪙 +{reward}
+"""
+    )
+
+
+@dp.message(Command("random"))
+async def random_player(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    players = group_members(
+        message.chat.id
+    )
+
+    if not players:
+        await message.answer(
+            "👥 Пока нет игроков."
+        )
+        return
+
+    player = random.choice(players)
+
+    name = (
+        player[1]
+        or player[2]
+        or "Игрок"
+    )
+
+    await message.answer(
+        f"""
+🎯 СЛУЧАЙНЫЙ ИГРОК
+
+🔥 {name}
+"""
+    )
+
+
+@dp.message(Command("duel"))
+async def duel(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    players = group_members(
+        message.chat.id
+    )
+
+    if len(players) < 2:
+        await message.answer(
+            "⚔️ Нужно минимум 2 игрока."
+        )
+        return
+
+    a, b = random.sample(
+        players,
+        2
+    )
+
+    winner = random.choice([
+        a,
+        b
+    ])
+
+    winner_name = (
+        winner[1]
+        or winner[2]
+        or "Игрок"
+    )
+
+    group_game(
+        message.chat.id,
+        winner[0],
+        True,
+        300
+    )
+
+    await message.answer(
+        f"""
+⚔️ ДУЭЛЬ
+
+🥊 {a[1]} VS {b[1]}
+
+🏆 Победитель:
+
+{winner_name}
+
+🪙 +300
+"""
+    )
+
+
+# =========================================================
+# GROUP TOP
+# =========================================================
+
+@dp.message(Command("top"))
+async def top(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_group(message)
+
+    players = group_members(
+        message.chat.id
+    )
+
+    players.sort(
+        key=lambda x: (
+            x[4],
+            x[5]
+        ),
+        reverse=True
+    )
+
+    text = "🏆 ТОП ГРУППЫ\n\n"
+
+    for i, p in enumerate(
+        players[:10],
+        1
+    ):
+
+        name = (
+            p[1]
+            or p[2]
+            or "Игрок"
+        )
+
+        text += (
+            f"{i}. {name} — "
+            f"🏆 {p[4]} побед | "
+            f"🪙 {p[5]}\n"
+        )
+
+    await message.answer(text)
+
+
+# =========================================================
+# EVENT
+# =========================================================
+
+@dp.message(Command("event"))
+async def event(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_group(message)
+
+    players = group_members(
+        message.chat.id
+    )
+
+    if len(players) < 2:
+        await message.answer(
+            "🎉 Для события нужно минимум 2 игрока."
+        )
+        return
+
+    winner = random.choice(players)
+
+    winner_name = (
+        winner[1]
+        or winner[2]
+        or "Игрок"
+    )
+
+    reward = random.randint(
+        500,
+        1500
+    )
+
+    group_game(
+        message.chat.id,
+        winner[0],
+        True,
+        reward
+    )
+
+    await message.answer(
+        f"""
+🎉 СЛУЧАЙНОЕ СОБЫТИЕ
+
+🔥 Все участники группы участвуют.
+
+👑 Победитель:
+
+{winner_name}
+
+🪙 +{reward}
+
+Следующее событие:
+/event
+"""
+    )
+
+
+# =========================================================
+# ======================= MAFIA ===========================
+# =========================================================
+
+MAFIA = {}
+
+
+def mafia_state(chat_id):
+
+    if chat_id not in MAFIA:
+
+        MAFIA[chat_id] = {
+            "players": {},
+            "active": False,
+            "phase": "lobby",
+            "night": 0,
+            "votes": {},
+            "killed": None
+        }
+
+    return MAFIA[chat_id]
+
+
+def mafia_reset(chat_id):
+    MAFIA[chat_id] = {
+        "players": {},
+        "active": False,
+        "phase": "lobby",
+        "night": 0,
+        "votes": {},
+        "killed": None
+    }
+
+
+@dp.message(Command("mafia"))
+async def mafia_create(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if state["active"]:
+        await message.answer(
+            "🎭 В этой группе уже идёт Мафия."
+        )
+        return
+
+    if state["players"]:
+        await message.answer(
+            f"""
+🎭 МАФИЯ УЖЕ СОБИРАЕТСЯ
+
+Игроков:
+{len(state["players"])}
+
+Присоединиться:
+/join
+
+Начать:
+/startmafia
+"""
+        )
+        return
+
+    state["players"][
+        message.from_user.id
+    ] = {
+        "name": message.from_user.first_name,
+        "alive": True,
+        "role": None
+    }
+
+    await message.answer(
+        """
+🎭 МАФИЯ
+
+Игра создана!
+
+👥 Минимум: 5 игроков
+👥 Оптимально: 7–12
+
+Чтобы войти:
+
+/join
+
+Когда все собрались:
+
+/startmafia
+"""
+    )
+
+
+@dp.message(Command("join"))
+async def mafia_join(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    ensure_user(message.from_user)
+    ensure_group(message)
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if state["active"]:
+
+        await message.answer(
+            "🎭 Игра уже началась."
+        )
+
+        return
+
+    if not state["players"]:
+
+        await message.answer(
+            "Сначала создай игру: /mafia"
+        )
+
+        return
+
+    user_id = message.from_user.id
+
+    if user_id in state["players"]:
+
+        await message.answer(
+            "Ты уже в игре."
+        )
+
+        return
+
+    if len(state["players"]) >= 20:
+
+        await message.answer(
+            "🎭 Лобби заполнено. Максимум 20 игроков."
+        )
+
+        return
+
+    state["players"][user_id] = {
+        "name": message.from_user.first_name,
+        "alive": True,
+        "role": None
+    }
+
+    await message.answer(
+        f"""
+🎭 {message.from_user.first_name} присоединился!
+
+👥 Игроков:
+{len(state["players"])}
+
+Минимум для старта: 5
+"""
+    )
+
+
+@dp.message(Command("startmafia"))
+async def mafia_start(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if state["active"]:
+
+        await message.answer(
+            "🎭 Мафия уже идёт."
+        )
+
+        return
+
+    players = list(
+        state["players"].keys()
+    )
+
+    if len(players) < 5:
+
+        await message.answer(
+            f"""
+🎭 Недостаточно игроков.
+
+Сейчас: {len(players)}
+Нужно: минимум 5
+
+Приглашайте людей и пишите:
+/join
+"""
+        )
+
+        return
+
+    # распределяем роли
+    count = len(players)
+
+    mafia_count = max(
+        1,
+        count // 4
+    )
+
+    roles = (
+        ["🔪 Мафия"] * mafia_count
+        + ["🕵️ Комиссар"]
+        + ["❤️ Доктор"]
+        + ["👤 Мирный"] * (
+            count
+            - mafia_count
+            - 2
+        )
+    )
+
+    random.shuffle(roles)
+
+    for user_id, role in zip(
+        players,
+        roles
+    ):
+
+        state["players"][user_id]["role"] = role
+
+        try:
+
+            await bot.send_message(
+                user_id,
+                f"""
+🎭 ТВОЯ РОЛЬ
+
+{role}
+
+Игра проходит в группе:
+{message.chat.title}
+
+Следи за событиями и не раскрывай свою роль.
+"""
+            )
+
+        except Exception:
+
+            pass
+
+    state["active"] = True
+    state["phase"] = "night"
+    state["night"] = 1
+
+    await message.answer(
+        f"""
+🎭 МАФИЯ НАЧАЛАСЬ!
+
+👥 Игроков: {count}
+
+🌙 НОЧЬ 1
+
+Мирные жители засыпают...
+
+🔪 Мафия выбирает жертву.
+🕵️ Комиссар проверяет игрока.
+❤️ Доктор спасает игрока.
+
+Роли отправлены игрокам в личные сообщения.
+
+Когда будете готовы к дневной фазе:
+ /day
+"""
+    )
+
+
+@dp.message(Command("mafia_status"))
+async def mafia_status(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if not state["players"]:
+
+        await message.answer(
+            "🎭 Сейчас Мафии нет."
+        )
+
+        return
+
+    alive = sum(
+        1
+        for p in state["players"].values()
+        if p["alive"]
+    )
+
+    await message.answer(
+        f"""
+🎭 СТАТУС МАФИИ
+
+👥 Всего игроков:
+{len(state["players"])}
+
+❤️ Живых:
+{alive}
+
+🌙 Ночь:
+{state["night"]}
+
+📍 Фаза:
+{state["phase"]}
+"""
+    )
+
+
+@dp.message(Command("day"))
+async def mafia_day(message: Message):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if not state["active"]:
+
+        await message.answer(
+            "🎭 Активной игры нет."
+        )
+
+        return
+
+    state["phase"] = "day"
+
+    alive_players = [
+        p["name"]
+        for p in state["players"].values()
+        if p["alive"]
+    ]
+
+    text = "☀️ ДЕНЬ\n\n"
+    text += "Живые игроки:\n\n"
+
+    for i, name in enumerate(
+        alive_players,
+        1
+    ):
+        text += f"{i}. {name}\n"
+
+    text += """
+    
+Обсуждайте подозреваемых.
+
+Для голосования используйте:
+
+/vote ИМЯ
+
+Например:
+
+/vote Алекс
+"""
+
+    await message.answer(text)
+
+
+@dp.message(Command("vote"))
+async def mafia_vote(
+    message: Message,
+    command: CommandObject
+):
+
+    if message.chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP
+    ):
+        return
+
+    state = mafia_state(
+        message.chat.id
+    )
+
+    if not state["active"]:
+        return
+
+    if state["phase"] != "day":
+
+        await message.answer(
+            "🌙 Сейчас ночь."
+        )
+
+        return
+
+    voter = state["players"].get(
+        message.from_user.id
+    )
+
+    if not voter or not voter["alive"]:
+
+        await message.answer(
+            "Ты не можешь голосовать."
+        )
+
+        return
+
+    target_name = (
+        command.args
+        if command
+        else None
+    )
+
+    if not target_name:
+
+        await message.answer(
+            "Используй: /vote ИМЯ"
+        )
+
+        return
+
+    target = None
+
+    for uid, player in state["players"].items():
+
+        if (
+            player["alive"]
+            and
+            player["name"].lower()
+            == target_name.lower()
+        ):
+            target = uid
+            break
+
+    if target is None:
+
+        await message.answer(
+            "❌ Игрок не найден."
+        )
+
+        return
+
+    state["votes"][
+        message.from_user.id
+    ] = target
+
+    alive_count = sum(
+        1
+        for p in state["players"].values()
+        if p["alive"]
+    )
+
+    await message.answer(
+        f"""
+🗳 {message.from_user.first_name}
+проголосовал.
+
+Голосов:
+{len(state["votes"])}/{alive_count}
+"""
+    )
+
+    if len(state["votes"]) >= alive_count:
+
+        counts = {}
+
+        for target_id in state["votes"].values():
+
+            counts[target_id] = (
+                counts.get(target_id, 0) + 1
+            )
+
+        eliminated = max(
+            counts,
+            key=counts.get
+        )
+
+        player = state["players"][eliminated]
+
+        player["alive"] = False
+
+        role = player["role"]
+
+        state["votes"] = {}
+        state["phase"] = "night"
+        state["night"] += 1
+
+        await message.answer(
+            f"""
+⚖️ ГОЛОСОВАНИЕ ОКОНЧЕНО
+
+🚪 Выбывает:
+
+{player["name"]}
+
+🎭 Его роль:
+
+{role}
+
+🌙 Наступает ночь {state["night"]}.
+"""
+        )
+
+        check_mafia_end(
+            message.chat.id
+        )
+
+
+def check_mafia_end(chat_id):
+
+    state = mafia_state(chat_id)
+
+    if not state["active"]:
+        return
+
+    alive = [
+        p
+        for p in state["players"].values()
+        if p["alive"]
+    ]
+
+    mafia = [
+        p
+        for p in alive
+        if p["role"] == "🔪 Мафия"
+    ]
+
+    citizens = [
+        p
+        for p in alive
+        if p["role"] != "🔪 Мафия"
+    ]
+
+    if not mafia:
+
+        state["active"] = False
+
+        return
+
+    if len(mafia) >= len(citizens):
+
+        state["active"] = False
 
 
 # =========================================================
@@ -772,28 +1527,13 @@ async def profile(call: CallbackQuery):
     if not row:
         return
 
-    (
-        uid,
-        username,
-        name,
-        coins,
-        xp,
-        level,
-        games,
-        wins,
-        losses,
-        streak,
-        daily,
-        premium,
-        referrals,
-        banned
-    ) = row
-
-    premium_text = (
-        "⭐ PREMIUM"
-        if premium > int(time.time())
-        else "FREE"
-    )
+    name = row[2]
+    coins = row[3]
+    xp = row[4]
+    level = row[5]
+    games = row[6]
+    wins = row[7]
+    losses = row[8]
 
     winrate = (
         round(wins / games * 100, 1)
@@ -803,28 +1543,25 @@ async def profile(call: CallbackQuery):
 
     await call.message.edit_text(
         f"""
-<b>👤 ПРОФИЛЬ</b>
+👤 ПРОФИЛЬ
 
 {name}
 
-{premium_text}
+🏅 Уровень: {level}
+⚡ XP: {xp}/{level * 100}
 
-🏅 Уровень: <b>{level}</b>
-⚡ XP: <b>{xp}/{level * 100}</b>
+💰 Монеты: {coins}
 
-💰 Монеты: <b>{coins}</b>
+🎮 Игр: {games}
+🏆 Побед: {wins}
+💀 Поражений: {losses}
 
-🎮 Игр: <b>{games}</b>
-🏆 Побед: <b>{wins}</b>
-💀 Поражений: <b>{losses}</b>
+📊 Винрейт: {winrate}%
 
-📊 Винрейт: <b>{winrate}%</b>
-
-🔥 Streak: <b>{streak}</b>
-
-👥 Рефералов: <b>{referrals}</b>
+⭐ Premium:
+{"Да" if premium(call.from_user.id) else "Нет"}
 """,
-        reply_markup=back()
+        reply_markup=back_keyboard()
     )
 
 
@@ -845,78 +1582,22 @@ async def economy(call: CallbackQuery):
 
     await call.message.edit_text(
         f"""
-<b>💰 ЭКОНОМИКА</b>
+💰 ЭКОНОМИКА
 
 Твой баланс:
 
-🪙 <b>{coins}</b>
+🪙 {coins}
 
-Как заработать:
+Зарабатывать можно через:
 
-🎮 Игры
+🎮 игры
 🎁 Daily
-🎯 Задания
-👥 Рефералы
-🏆 Победы
-🎉 События
-
-Чем активнее играешь — тем выше уровень.
+🎭 Мафию
+🏆 победы
+👥 рефералов
+🎉 события
 """,
-        reply_markup=back()
-    )
-
-
-# =========================================================
-# TOP
-# =========================================================
-
-@dp.callback_query(F.data == "top")
-async def top(call: CallbackQuery):
-
-    await call.answer()
-
-    with closing(connect()) as db:
-
-        rows = db.execute("""
-        SELECT
-            name,
-            wins,
-            coins,
-            level
-        FROM users
-        WHERE banned=0
-        ORDER BY wins DESC, level DESC, coins DESC
-        LIMIT 10
-        """).fetchall()
-
-    text = "<b>🏆 ГЛОБАЛЬНЫЙ ТОП</b>\n\n"
-
-    medals = [
-        "🥇",
-        "🥈",
-        "🥉"
-    ]
-
-    for i, row in enumerate(rows, 1):
-
-        name, wins, coins, level = row
-
-        icon = (
-            medals[i - 1]
-            if i <= 3
-            else f"{i}."
-        )
-
-        text += (
-            f"{icon} <b>{name}</b>\n"
-            f"   🏆 {wins} | "
-            f"🪙 {coins} | "
-            f"LVL {level}\n"
-        )
-
-    await call.message.edit_text(
-        text,
-        reply_markup=back()
+        reply_markup=back_keyboard()
     )
 
 
@@ -933,168 +1614,170 @@ async def daily(call: CallbackQuery):
 
     row = get_user(user_id)
 
-    if not row:
-        return
-
-    last = row[10]
-    streak = row[9]
-
     now = int(time.time())
 
-    if now - last < 86400:
+    if now - row[10] < 86400:
 
         left = 86400 - (
-            now - last
+            now - row[10]
         )
 
         hours = left // 3600
-        minutes = (
-            left % 3600
-        ) // 60
+        minutes = (left % 3600) // 60
 
         await call.message.edit_text(
             f"""
-<b>🎁 DAILY</b>
+🎁 DAILY
 
 Ты уже получил награду.
 
-⏳ Осталось:
-<b>{hours}ч {minutes}мин</b>
-
-🔥 Streak: {streak}
+⏳ {hours}ч {minutes}мин
 """,
-            reply_markup=back()
+            reply_markup=back_keyboard()
         )
 
         return
 
-    streak += 1
+    reward = 200
 
-    reward = 100 + min(
-        streak * 25,
-        500
-    )
-
-    if is_premium(user_id):
+    if premium(user_id):
         reward *= 2
 
-    with closing(connect()) as db:
-
-        db.execute("""
-        UPDATE users
-        SET
-            coins=coins+?,
-            last_daily=?,
-            streak=?
-        WHERE id=?
-        """, (
-            reward,
-            now,
-            streak,
-            user_id
-        ))
-
-        db.commit()
+    add_coins(
+        user_id,
+        reward
+    )
 
     add_xp(
         user_id,
         30
     )
 
+    with closing(db()) as con:
+
+        con.execute("""
+        UPDATE users
+        SET
+            last_daily=?,
+            streak=streak+1
+        WHERE id=?
+        """, (
+            now,
+            user_id
+        ))
+
+        con.commit()
+
     await call.message.edit_text(
         f"""
-🎉 <b>DAILY ПОЛУЧЕН!</b>
+🎁 DAILY ПОЛУЧЕН!
 
-🪙 +<b>{reward}</b>
+🪙 +{reward}
 
-🔥 Streak: <b>{streak}</b>
-
-Продолжай заходить каждый день.
+🔥 Заходи завтра снова.
 """,
-        reply_markup=back()
+        reply_markup=back_keyboard()
     )
 
 
 # =========================================================
-# ACHIEVEMENTS
+# GAMES MENU
 # =========================================================
 
-@dp.callback_query(F.data == "achievements")
-async def achievements(call: CallbackQuery):
+@dp.callback_query(F.data == "games")
+async def games(call: CallbackQuery):
 
     await call.answer()
 
-    with closing(connect()) as db:
-
-        rows = db.execute("""
-        SELECT achievement
-        FROM achievements
-        WHERE user_id=?
-        ORDER BY created DESC
-        """, (
-            call.from_user.id,
-        )).fetchall()
-
-    if not rows:
-
-        text = """
-<b>🏅 ДОСТИЖЕНИЯ</b>
-
-Пока пусто.
-
-Играй и открывай достижения!
-"""
-
-    else:
-
-        text = "<b>🏅 ДОСТИЖЕНИЯ</b>\n\n"
-
-        for row in rows:
-
-            text += (
-                f"🏅 {row[0]}\n"
-            )
-
     await call.message.edit_text(
-        text,
-        reply_markup=back()
+        """
+🎮 ИГРЫ
+
+В группе доступны:
+
+🎲 /dice
+🪙 /coin
+🎰 /slot
+⚔️ /duel
+🎯 /random
+🏆 /top
+🎉 /event
+
+🎭 Большая игра:
+
+/mafia
+""",
+        reply_markup=back_keyboard()
     )
 
 
 # =========================================================
-# REFERRALS
+# MAFIA INFO
 # =========================================================
 
-@dp.callback_query(F.data == "referrals")
-async def referrals(call: CallbackQuery):
+@dp.callback_query(F.data == "mafia_info")
+async def mafia_info(call: CallbackQuery):
+
+    await call.answer()
+
+    await call.message.edit_text(
+        """
+🎭 МАФИЯ
+
+Большая групповая игра.
+
+Минимум:
+👥 5 игроков
+
+Роли:
+
+🔪 Мафия
+🕵️ Комиссар
+❤️ Доктор
+👤 Мирные
+
+Как начать в группе:
+
+/mafia
+
+Игроки:
+
+/join
+
+Старт:
+
+/startmafia
+
+Статус:
+
+/mafia_status
+""",
+        reply_markup=back_keyboard()
+    )
+
+
+# =========================================================
+# ADD GROUP
+# =========================================================
+
+@dp.callback_query(F.data == "add_group")
+async def add_group(call: CallbackQuery):
 
     await call.answer()
 
     me = await bot.get_me()
 
-    link = (
+    url = (
         f"https://t.me/{me.username}"
-        f"?start=ref_{call.from_user.id}"
+        "?startgroup=true"
     )
 
-    row = get_user(
-        call.from_user.id
-    )
-
-    refs = row[12] if row else 0
-
-    share = (
-        "https://t.me/share/url"
-        f"?url={link}"
-        "&text=🎲%20Залетай%20в%20RANDOM%20PARTY!"
-    )
-
-    kb = InlineKeyboardMarkup(
+    keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📤 Пригласить",
-                    url=share
+                    text="➕ Добавить в группу",
+                    url=url
                 )
             ],
             [
@@ -1107,525 +1790,20 @@ async def referrals(call: CallbackQuery):
     )
 
     await call.message.edit_text(
-        f"""
-<b>👥 РЕФЕРАЛЫ</b>
-
-Приглашено:
-<b>{refs}</b>
-
-За каждого нового игрока:
-
-🪙 +500 монет
-⭐ +1 день Premium
-
-Твоя ссылка:
-
-<code>{link}</code>
-""",
-        reply_markup=kb
-    )
-
-
-# =========================================================
-# GAMES
-# =========================================================
-
-@dp.callback_query(F.data == "games")
-async def games(call: CallbackQuery):
-
-    await call.answer()
-
-    await call.message.edit_text(
         """
-<b>🎮 ИГРЫ</b>
+👥 ДОБАВИТЬ RANDOM PARTY
 
-Выбирай игру:
+Добавь бота в группу и запускай:
 
-🪙 Монетка
-🎲 Кубик
-🎰 Слот
-✊ КНБ
-🔢 Число
-⚡ Множитель
-🎁 Сундук
-🧠 Викторина
-💎 Premium Jackpot
+🎮 игры
+🎭 Мафию
+⚔️ дуэли
+🏆 рейтинги
+🎉 события
+
+Бот сам отправит приветственное сообщение после добавления.
 """,
-        reply_markup=games_menu()
-    )
-
-
-# =========================================================
-# COIN
-# =========================================================
-
-@dp.callback_query(F.data == "game_coin")
-async def coin(call: CallbackQuery):
-
-    result = random.choice([
-        "🦅 ОРЁЛ",
-        "🪙 РЕШКА"
-    ])
-
-    reward = 15
-
-    game_result(
-        call.from_user.id,
-        reward=reward
-    )
-
-    await call.answer(
-        f"{result}\n\n🪙 +{reward}",
-        show_alert=True
-    )
-
-
-# =========================================================
-# DICE
-# =========================================================
-
-@dp.callback_query(F.data == "game_dice")
-async def dice(call: CallbackQuery):
-
-    value = random.randint(
-        1,
-        6
-    )
-
-    reward = value * 10
-
-    game_result(
-        call.from_user.id,
-        reward=reward
-    )
-
-    await call.answer(
-        f"🎲 Выпало: {value}\n\n"
-        f"🪙 +{reward}",
-        show_alert=True
-    )
-
-
-# =========================================================
-# SLOT
-# =========================================================
-
-@dp.callback_query(F.data == "game_slot")
-async def slot(call: CallbackQuery):
-
-    symbols = [
-        "🍒",
-        "🍋",
-        "🍊",
-        "⭐",
-        "💎",
-        "7️⃣"
-    ]
-
-    a, b, c = [
-        random.choice(symbols)
-        for _ in range(3)
-    ]
-
-    if a == b == c:
-
-        reward = 1000
-        win = True
-
-        result = "💎 ДЖЕКПОТ!"
-
-    elif (
-        a == b
-        or
-        b == c
-        or
-        a == c
-    ):
-
-        reward = 150
-        win = True
-
-        result = "🔥 ПАРА!"
-
-    else:
-
-        reward = 10
-        win = False
-
-        result = "😈 Не повезло"
-
-    game_result(
-        call.from_user.id,
-        win=win,
-        reward=reward
-    )
-
-    await call.answer(
-        f"""
-🎰 {a} {b} {c}
-
-{result}
-
-🪙 +{reward}
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# RPS
-# =========================================================
-
-@dp.callback_query(F.data == "game_rps")
-async def rps(call: CallbackQuery):
-
-    user = random.choice([
-        "✊",
-        "✌️",
-        "📄"
-    ])
-
-    enemy = random.choice([
-        "✊",
-        "✌️",
-        "📄"
-    ])
-
-    if user == enemy:
-
-        reward = 20
-        win = False
-
-        text = "🤝 Ничья"
-
-    elif (
-        (user == "✊" and enemy == "✌️")
-        or
-        (user == "✌️" and enemy == "📄")
-        or
-        (user == "📄" and enemy == "✊")
-    ):
-
-        reward = 100
-        win = True
-
-        text = "🏆 Победа!"
-
-    else:
-
-        reward = 5
-        win = False
-
-        text = "💀 Поражение"
-
-    game_result(
-        call.from_user.id,
-        win=win,
-        reward=reward
-    )
-
-    await call.answer(
-        f"""
-Ты: {user}
-Бот: {enemy}
-
-{text}
-
-🪙 +{reward}
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# NUMBER
-# =========================================================
-
-@dp.callback_query(F.data == "game_number")
-async def number_game(call: CallbackQuery):
-
-    number = random.randint(
-        1,
-        10000
-    )
-
-    reward = 50
-
-    game_result(
-        call.from_user.id,
-        reward=reward
-    )
-
-    await call.answer(
-        f"""
-🔢 Твоё число:
-
-<b>{number}</b>
-
-🪙 +{reward}
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# MULTIPLIER
-# =========================================================
-
-@dp.callback_query(F.data == "game_multiplier")
-async def multiplier(call: CallbackQuery):
-
-    n = random.randint(
-        1,
-        100
-    )
-
-    if n >= 98:
-        mult = "x10"
-        reward = 1000
-
-    elif n >= 90:
-        mult = "x5"
-        reward = 500
-
-    elif n >= 70:
-        mult = "x2"
-        reward = 200
-
-    else:
-        mult = "x1"
-        reward = 25
-
-    game_result(
-        call.from_user.id,
-        win=reward >= 200,
-        reward=reward
-    )
-
-    await call.answer(
-        f"""
-⚡ МНОЖИТЕЛЬ
-
-🎯 {n}
-
-<b>{mult}</b>
-
-🪙 +{reward}
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# CHEST
-# =========================================================
-
-@dp.callback_query(F.data == "game_chest")
-async def chest(call: CallbackQuery):
-
-    rewards = [
-        50,
-        100,
-        150,
-        250,
-        500,
-        1000,
-        2500
-    ]
-
-    reward = random.choice(
-        rewards
-    )
-
-    if is_premium(
-        call.from_user.id
-    ):
-        reward = int(
-            reward * 1.5
-        )
-
-    add_coins(
-        call.from_user.id,
-        reward
-    )
-
-    add_xp(
-        call.from_user.id,
-        25
-    )
-
-    await call.answer(
-        f"""
-🎁 СУНДУК ОТКРЫТ!
-
-🪙 +<b>{reward}</b>
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# PREMIUM JACKPOT
-# =========================================================
-
-@dp.callback_query(
-    F.data == "game_premium_jackpot"
-)
-async def premium_jackpot(
-    call: CallbackQuery
-):
-
-    if not is_premium(
-        call.from_user.id
-    ):
-
-        await call.answer(
-            "⭐ Эта игра только для Premium.",
-            show_alert=True
-        )
-
-        return
-
-    n = random.randint(
-        1,
-        100
-    )
-
-    if n >= 97:
-        reward = 5000
-    elif n >= 85:
-        reward = 1000
-    elif n >= 60:
-        reward = 500
-    else:
-        reward = 100
-
-    add_coins(
-        call.from_user.id,
-        reward
-    )
-
-    add_xp(
-        call.from_user.id,
-        75
-    )
-
-    await call.answer(
-        f"""
-💎 PREMIUM JACKPOT
-
-🎯 {n}
-
-🪙 +<b>{reward}</b>
-""",
-        show_alert=True
-    )
-
-
-# =========================================================
-# QUIZ
-# =========================================================
-
-QUESTIONS = [
-    (
-        "Столица Франции?",
-        ["Париж", "Лион", "Марсель", "Ницца"],
-        0
-    ),
-    (
-        "Самая большая планета?",
-        ["Марс", "Юпитер", "Земля", "Венера"],
-        1
-    ),
-    (
-        "15 × 6 = ?",
-        ["80", "90", "100", "120"],
-        1
-    ),
-    (
-        "Единица силы тока?",
-        ["Вольт", "Ампер", "Ом", "Ватт"],
-        1
-    ),
-    (
-        "Кто написал «Евгения Онегина»?",
-        ["Пушкин", "Гоголь", "Толстой", "Лермонтов"],
-        0
-    ),
-]
-
-
-@dp.callback_query(F.data == "game_quiz")
-async def quiz(call: CallbackQuery):
-
-    question, answers, correct = random.choice(
-        QUESTIONS
-    )
-
-    b = InlineKeyboardBuilder()
-
-    for i, answer in enumerate(answers):
-
-        b.button(
-            text=answer,
-            callback_data=f"quiz:{correct}:{i}"
-        )
-
-    b.adjust(1)
-
-    await call.message.edit_text(
-        f"""
-<b>🧠 ВИКТОРИНА</b>
-
-{question}
-""",
-        reply_markup=b.as_markup()
-    )
-
-
-@dp.callback_query(
-    F.data.startswith("quiz:")
-)
-async def quiz_answer(
-    call: CallbackQuery
-):
-
-    _, correct, answer = call.data.split(":")
-
-    correct = int(correct)
-    answer = int(answer)
-
-    if correct == answer:
-
-        reward = 250
-
-        game_result(
-            call.from_user.id,
-            win=True,
-            reward=reward
-        )
-
-        text = (
-            "🎉 <b>ПРАВИЛЬНО!</b>\n\n"
-            f"🪙 +{reward}"
-        )
-
-    else:
-
-        game_result(
-            call.from_user.id
-        )
-
-        text = "❌ Неправильно."
-
-    await call.answer(
-        text,
-        show_alert=True
-    )
-
-    await call.message.edit_text(
-        text,
-        reply_markup=games_menu()
+        reply_markup=keyboard
     )
 
 
@@ -1634,45 +1812,34 @@ async def quiz_answer(
 # =========================================================
 
 @dp.callback_query(F.data == "premium")
-async def premium(call: CallbackQuery):
+async def premium_menu(call: CallbackQuery):
 
     await call.answer()
 
-    active = is_premium(
-        call.from_user.id
-    )
-
-    status = (
-        "🟢 Premium активен"
-        if active
-        else "⚪ Premium не активен"
-    )
-
     await call.message.edit_text(
         f"""
-<b>⭐ RANDOM PARTY PREMIUM</b>
+⭐ PREMIUM
 
-{status}
+Стоимость:
+{PREMIUM_STARS} ⭐ / 30 дней
 
-<b>Что ты получаешь:</b>
+Premium даёт:
 
-⚡ <b>+50% ко всем игровым наградам</b>
-🎁 <b>x2 Daily</b>
-💎 Premium Jackpot
+⚡ +50% игровые награды
+🎁 x2 Daily
+💎 Premium игры
 🎁 усиленные сундуки
-🏅 Premium-достижения
-👑 Premium-статус
-🏟️ специальные групповые возможности
-🔥 эксклюзивные события
-📈 ускоренная прокачка
+📈 ускоренную прокачку
+👑 Premium статус
+🎭 специальные функции
 
-<b>{PREMIUM_STARS} ⭐ / 30 дней</b>
+Покупка происходит через Telegram Stars.
 """,
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=f"⭐ Купить за {PREMIUM_STARS} Stars",
+                        text=f"⭐ Купить за {PREMIUM_STARS}",
                         callback_data="buy_premium"
                     )
                 ],
@@ -1688,9 +1855,7 @@ async def premium(call: CallbackQuery):
 
 
 @dp.callback_query(F.data == "buy_premium")
-async def buy_premium(
-    call: CallbackQuery
-):
+async def buy_premium(call: CallbackQuery):
 
     await call.answer()
 
@@ -1716,23 +1881,9 @@ async def buy_premium(
 
 
 @dp.pre_checkout_query()
-async def checkout(
+async def pre_checkout(
     query: PreCheckoutQuery
 ):
-
-    if query.currency != "XTR":
-        await query.answer(
-            ok=False,
-            error_message="Неверная валюта."
-        )
-        return
-
-    if query.total_amount != PREMIUM_STARS:
-        await query.answer(
-            ok=False,
-            error_message="Неверная сумма."
-        )
-        return
 
     await query.answer(
         ok=True
@@ -1740,7 +1891,7 @@ async def checkout(
 
 
 @dp.message(F.successful_payment)
-async def payment(
+async def successful_payment(
     message: Message
 ):
 
@@ -1753,14 +1904,44 @@ async def payment(
 
     user_id = message.from_user.id
 
-    activate_premium(
-        user_id,
-        PREMIUM_DAYS
-    )
+    now = int(time.time())
 
-    with closing(connect()) as db:
+    with closing(db()) as con:
 
-        db.execute("""
+        current = con.execute("""
+        SELECT premium_until
+        FROM users
+        WHERE id=?
+        """, (
+            user_id,
+        )).fetchone()
+
+        current_until = (
+            current[0]
+            if current
+            else 0
+        )
+
+        start = max(
+            now,
+            current_until
+        )
+
+        until = (
+            start
+            + PREMIUM_DAYS * 86400
+        )
+
+        con.execute("""
+        UPDATE users
+        SET premium_until=?
+        WHERE id=?
+        """, (
+            until,
+            user_id
+        ))
+
+        con.execute("""
         INSERT INTO payments
         (user_id, stars, payload, charge_id, created)
         VALUES (?, ?, ?, ?, ?)
@@ -1769,792 +1950,21 @@ async def payment(
             payment.total_amount,
             payment.invoice_payload,
             payment.telegram_payment_charge_id,
-            int(time.time())
+            now
         ))
 
-        db.commit()
+        con.commit()
 
     await message.answer(
         """
-🎉 <b>PREMIUM АКТИВИРОВАН!</b>
+🎉 PREMIUM АКТИВИРОВАН!
 
-⭐ 30 дней Premium активированы.
+⭐ 30 дней
 
-Теперь доступны:
-
-⚡ повышенные награды
-🎁 усиленный Daily
-💎 Premium Jackpot
-🎁 усиленные сундуки
-👑 Premium-статус
-🏟️ специальные функции
+Теперь тебе доступны
+повышенные награды и Premium-функции.
 """,
-        reply_markup=main_menu()
-    )
-
-    if ADMIN_ID:
-
-        try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"""
-💰 <b>НОВАЯ ПОКУПКА</b>
-
-👤 ID:
-<code>{user_id}</code>
-
-⭐ Stars:
-<b>{payment.total_amount}</b>
-"""
-            )
-        except Exception:
-            pass
-
-
-# =========================================================
-# ADD GROUP
-# =========================================================
-
-@dp.callback_query(F.data == "add_group")
-async def add_group(call: CallbackQuery):
-
-    await call.answer()
-
-    me = await bot.get_me()
-
-    url = (
-        f"https://t.me/{me.username}"
-        "?startgroup=true"
-    )
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Добавить в группу",
-                    url=url
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data="home"
-                )
-            ]
-        ]
-    )
-
-    await call.message.edit_text(
-        """
-<b>👥 RANDOM PARTY ДЛЯ ГРУПП</b>
-
-Добавь бота в чат.
-
-После этого участники смогут:
-
-🎮 играть
-⚔️ устраивать дуэли
-🎯 выбирать случайного игрока
-🏆 соревноваться
-📈 прокачивать группу
-🎉 запускать события
-💰 зарабатывать монеты
-
-Команды можно использовать прямо в группе.
-""",
-        reply_markup=kb
-    )
-
-
-# =========================================================
-# GROUP START
-# =========================================================
-
-@dp.message(Command("party"))
-async def party(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    await message.answer(
-        """
-🎲 <b>RANDOM PARTY подключён!</b>
-
-Теперь эта группа — игровая арена.
-
-🎮 <b>Играть</b> — /games
-⚔️ <b>Дуэль</b> — /duel
-🎯 <b>Случайный игрок</b> — /random
-🎲 <b>Кубик</b> — /dice
-🎰 <b>Слот</b> — /slot
-🧠 <b>Викторина</b> — /quiz
-🏆 <b>Рейтинг</b> — /top
-🎉 <b>Событие</b> — /event
-
-🔥 Зови друзей и прокачивай арену!
-"""
-    )
-
-
-@dp.message(Command("games"))
-async def group_games(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    await message.answer(
-        """
-🎮 <b>ИГРЫ</b>
-
-/dice — кубик
-/coin — монетка
-/slot — слот
-/duel — дуэль
-/random — случайный игрок
-/quiz — викторина
-/event — групповое событие
-/top — рейтинг
-"""
-    )
-
-
-# =========================================================
-# GROUP RANDOM
-# =========================================================
-
-@dp.message(Command("random"))
-async def random_player(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    players = group_members(
-        message.chat.id
-    )
-
-    if not players:
-
-        await message.answer(
-            "👥 Пока никто не зарегистрирован."
-        )
-        return
-
-    player = random.choice(
-        players
-    )
-
-    name = (
-        player[1]
-        or player[2]
-        or "Игрок"
-    )
-
-    await message.answer(
-        f"""
-🎯 <b>СЛУЧАЙНЫЙ ИГРОК</b>
-
-Сегодня выбран:
-
-🔥 <b>{name}</b>
-"""
-    )
-
-
-# =========================================================
-# GROUP DUEL
-# =========================================================
-
-@dp.message(Command("duel"))
-async def duel(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    players = group_members(
-        message.chat.id
-    )
-
-    if len(players) < 2:
-
-        await message.answer(
-            "⚔️ Нужно минимум 2 участника."
-        )
-
-        return
-
-    a, b = random.sample(
-        players,
-        2
-    )
-
-    winner = random.choice(
-        [a, b]
-    )
-
-    a_name = (
-        a[1]
-        or a[2]
-        or "Игрок"
-    )
-
-    b_name = (
-        b[1]
-        or b[2]
-        or "Игрок"
-    )
-
-    winner_name = (
-        winner[1]
-        or winner[2]
-        or "Игрок"
-    )
-
-    reward = 300
-
-    group_game(
-        message.chat.id,
-        winner[0],
-        win=True,
-        reward=reward
-    )
-
-    await message.answer(
-        f"""
-⚔️ <b>ДУЭЛЬ</b>
-
-🥊 {a_name}
-VS
-🥊 {b_name}
-
-━━━━━━━━━━━━
-
-🏆 Победитель:
-
-<b>{winner_name}</b>
-
-🪙 +{reward}
-"""
-    )
-
-
-# =========================================================
-# GROUP DICE
-# =========================================================
-
-@dp.message(Command("dice"))
-async def group_dice(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    value = random.randint(
-        1,
-        6
-    )
-
-    reward = value * 15
-
-    group_game(
-        message.chat.id,
-        message.from_user.id,
-        reward=reward
-    )
-
-    await message.answer(
-        f"""
-🎲 <b>КУБИК</b>
-
-{message.from_user.first_name}
-
-выпало:
-
-<b>{value}</b>
-
-🪙 +{reward}
-"""
-    )
-
-
-# =========================================================
-# GROUP COIN
-# =========================================================
-
-@dp.message(Command("coin"))
-async def group_coin(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    result = random.choice([
-        "🦅 ОРЁЛ",
-        "🪙 РЕШКА"
-    ])
-
-    await message.answer(
-        f"🪙 <b>{result}</b>"
-    )
-
-
-# =========================================================
-# GROUP SLOT
-# =========================================================
-
-@dp.message(Command("slot"))
-async def group_slot(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    symbols = [
-        "🍒",
-        "🍋",
-        "⭐",
-        "💎",
-        "7️⃣"
-    ]
-
-    a, b, c = [
-        random.choice(symbols)
-        for _ in range(3)
-    ]
-
-    if a == b == c:
-
-        reward = 1000
-        win = True
-
-        result = "💎 ДЖЕКПОТ!"
-
-    elif (
-        a == b
-        or
-        b == c
-        or
-        a == c
-    ):
-
-        reward = 150
-        win = True
-
-        result = "🔥 ПАРА!"
-
-    else:
-
-        reward = 10
-        win = False
-
-        result = "😈 Не повезло"
-
-    group_game(
-        message.chat.id,
-        message.from_user.id,
-        win=win,
-        reward=reward
-    )
-
-    await message.answer(
-        f"""
-🎰 {a} {b} {c}
-
-{result}
-
-🪙 +{reward}
-"""
-    )
-
-
-# =========================================================
-# GROUP QUIZ
-# =========================================================
-
-@dp.message(Command("quiz"))
-async def group_quiz(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    question, answers, correct = random.choice(
-        QUESTIONS
-    )
-
-    await message.answer(
-        f"""
-🧠 <b>ВИКТОРИНА</b>
-
-{question}
-
-1️⃣ {answers[0]}
-2️⃣ {answers[1]}
-3️⃣ {answers[2]}
-4️⃣ {answers[3]}
-
-Первый правильный ответ получает 🪙 <b>500</b>.
-"""
-    )
-
-
-@dp.message(
-    F.chat.type.in_({
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    })
-)
-async def quiz_text_handler(message: Message):
-
-    # Обычные сообщения не обрабатываем,
-    # если это не число 1-4.
-
-    if not message.text:
-        return
-
-    if message.text not in (
-        "1",
-        "2",
-        "3",
-        "4"
-    ):
-        return
-
-    # Ничего не начисляем без активной
-    # игровой сессии.
-    #
-    # Этот обработчик оставлен специально,
-    # чтобы позже можно было добавить
-    # полноценные live-раунды.
-
-
-# =========================================================
-# GROUP TOP
-# =========================================================
-
-@dp.message(Command("top"))
-async def group_top(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    rows = group_members(
-        message.chat.id
-    )
-
-    rows = sorted(
-        rows,
-        key=lambda x: (
-            x[4],
-            x[5]
-        ),
-        reverse=True
-    )[:10]
-
-    text = "<b>🏆 ТОП ГРУППЫ</b>\n\n"
-
-    for i, row in enumerate(
-        rows,
-        1
-    ):
-
-        name = (
-            row[1]
-            or row[2]
-            or "Игрок"
-        )
-
-        text += (
-            f"{i}. <b>{name}</b>\n"
-            f"   🏆 {row[4]} | "
-            f"🪙 {row[5]}\n"
-        )
-
-    await message.answer(
-        text
-    )
-
-
-# =========================================================
-# GROUP EVENT
-# =========================================================
-
-@dp.message(Command("event"))
-async def event(message: Message):
-
-    if message.chat.type not in (
-        ChatType.GROUP,
-        ChatType.SUPERGROUP
-    ):
-        return
-
-    ensure_group(message)
-
-    players = group_members(
-        message.chat.id
-    )
-
-    if len(players) < 2:
-
-        await message.answer(
-            """
-🎉 <b>СОБЫТИЕ</b>
-
-Для запуска события нужно минимум
-<b>2 участника</b>.
-
-Пусть участники напишут:
-
-/party
-"""
-        )
-
-        return
-
-    event_name = random.choice([
-        "⚔️ БИТВА АРЕНЫ",
-        "💎 ОХОТА ЗА СОКРОВИЩЕМ",
-        "🔥 CHAOS EVENT",
-        "👑 КОРОЛЬ ГРУППЫ",
-        "🎯 ОХОТА"
-    ])
-
-    participants = random.sample(
-        players,
-        min(
-            len(players),
-            8
-        )
-    )
-
-    winner = random.choice(
-        participants
-    )
-
-    winner_name = (
-        winner[1]
-        or winner[2]
-        or "Игрок"
-    )
-
-    reward = random.randint(
-        500,
-        1500
-    )
-
-    group_game(
-        message.chat.id,
-        winner[0],
-        win=True,
-        reward=reward
-    )
-
-    await message.answer(
-        f"""
-🎉 <b>{event_name}</b>
-
-Участников:
-<b>{len(participants)}</b>
-
-🔥 Арена начинается...
-
-3...
-2...
-1...
-
-━━━━━━━━━━━━
-
-👑 ПОБЕДИТЕЛЬ:
-
-<b>{winner_name}</b>
-
-🪙 <b>+{reward}</b>
-
-🔥 Следующее событие можно
-запустить снова через /event
-"""
-    )
-
-
-# =========================================================
-# USER ID
-# =========================================================
-
-@dp.message(Command("id"))
-async def get_id(message: Message):
-
-    await message.answer(
-        f"""
-🆔 Твой Telegram ID:
-
-<code>{message.from_user.id}</code>
-"""
-    )
-
-
-# =========================================================
-# ADMIN
-# =========================================================
-
-@dp.message(Command("stats"))
-async def stats(message: Message):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    with closing(connect()) as db:
-
-        users = db.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        groups = db.execute(
-            "SELECT COUNT(*) FROM groups"
-        ).fetchone()[0]
-
-        premium = db.execute("""
-        SELECT COUNT(*)
-        FROM users
-        WHERE premium_until>?
-        """, (
-            int(time.time()),
-        )).fetchone()[0]
-
-        payments = db.execute(
-            "SELECT COUNT(*) FROM payments"
-        ).fetchone()[0]
-
-        stars = db.execute(
-            "SELECT COALESCE(SUM(stars),0)"
-            " FROM payments"
-        ).fetchone()[0]
-
-    await message.answer(
-        f"""
-<b>📊 СТАТИСТИКА</b>
-
-👤 Пользователей:
-<b>{users}</b>
-
-👥 Групп:
-<b>{groups}</b>
-
-⭐ Premium:
-<b>{premium}</b>
-
-💳 Покупок:
-<b>{payments}</b>
-
-🌟 Stars:
-<b>{stars}</b>
-"""
-    )
-
-
-@dp.message(Command("ban"))
-async def ban(message: Message):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        await message.answer(
-            "/ban ID"
-        )
-        return
-
-    if not parts[1].isdigit():
-        return
-
-    target = int(
-        parts[1]
-    )
-
-    with closing(connect()) as db:
-        db.execute("""
-        UPDATE users
-        SET banned=1
-        WHERE id=?
-        """, (
-            target,
-        ))
-        db.commit()
-
-    await message.answer(
-        "🔨 Пользователь заблокирован."
-    )
-
-
-@dp.message(Command("unban"))
-async def unban(message: Message):
-
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-
-    if len(parts) != 2:
-        return
-
-    if not parts[1].isdigit():
-        return
-
-    target = int(
-        parts[1]
-    )
-
-    with closing(connect()) as db:
-        db.execute("""
-        UPDATE users
-        SET banned=0
-        WHERE id=?
-        """, (
-            target,
-        ))
-        db.commit()
-
-    await message.answer(
-        "✅ Пользователь разблокирован."
+        reply_markup=home_keyboard()
     )
 
 
@@ -2562,74 +1972,72 @@ async def unban(message: Message):
 # HELP
 # =========================================================
 
-@dp.callback_query(F.data == "help")
-async def help_menu(call: CallbackQuery):
+@dp.callback_query(F.data == "home")
+async def home(call: CallbackQuery):
 
     await call.answer()
 
     await call.message.edit_text(
         """
-<b>ℹ️ RANDOM PARTY</b>
+🎲 RANDOM PARTY
 
-<b>В личке:</b>
-
-/start
-/id
-
-<b>В группе:</b>
-
-/party
-/games
-/duel
-/random
-/dice
-/coin
-/slot
-/quiz
-/top
-/event
-
-<b>Админ:</b>
-
-/stats
-/ban ID
-/unban ID
-
-Главное меню доступно через /start.
+Главное меню.
 """,
-        reply_markup=back()
+        reply_markup=home_keyboard()
     )
 
 
 # =========================================================
-# PRIVATE FALLBACK
+# ADMIN
 # =========================================================
 
-@dp.message()
-async def fallback(message: Message):
-
-    if message.chat.type != ChatType.PRIVATE:
-        return
-
-    ensure_user(
-        message.from_user
-    )
-
-    row = get_user(
-        message.from_user.id
-    )
-
-    if row and row[13]:
-        return
+@dp.message(Command("id"))
+async def get_id(message: Message):
 
     await message.answer(
-        "👇 Выбирай действие:",
-        reply_markup=main_menu()
+        f"🆔 Твой ID: {message.from_user.id}"
+    )
+
+
+@dp.message(Command("stats"))
+async def stats(message: Message):
+
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    with closing(db()) as con:
+
+        users = con.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        groups = con.execute(
+            "SELECT COUNT(*) FROM groups"
+        ).fetchone()[0]
+
+        payments = con.execute(
+            "SELECT COUNT(*) FROM payments"
+        ).fetchone()[0]
+
+        stars = con.execute(
+            "SELECT COALESCE(SUM(stars),0) FROM payments"
+        ).fetchone()[0]
+
+    await message.answer(
+        f"""
+📊 СТАТИСТИКА
+
+👤 Пользователей: {users}
+👥 Групп: {groups}
+
+💳 Покупок: {payments}
+⭐ Stars: {stars}
+"""
     )
 
 
 # =========================================================
-# START BOT
+# RUN
 # =========================================================
 
 async def main():
@@ -2639,7 +2047,7 @@ async def main():
     me = await bot.get_me()
 
     logging.info(
-        "Started @%s",
+        "Bot started: @%s",
         me.username
     )
 
